@@ -309,6 +309,20 @@ fn no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_TEXTURE_DETILE_WORKERS=2..4` splits large 2D subresources into
+/// row bands. Small mips stay serial so thread startup does not dominate.
+fn detile_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        let requested = std::env::var("VICTORY_TEXTURE_DETILE_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        requested.min(std::thread::available_parallelism().map_or(1, usize::from))
+    })
+}
+
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
@@ -329,6 +343,8 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// CPU time spent converting tiled data to upload rows, summed across threads.
+pub(crate) static DETILE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -657,6 +673,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 impl Staging {
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -859,6 +876,8 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let started = std::time::Instant::now();
+        let workers = detile_workers();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
@@ -868,14 +887,19 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
+            let depth_pitch = pitch * rows as usize;
+            let result = if workers > 1 && len >= 4 * 1024 * 1024 {
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+                    .detile_parallel(tiled, mip, slice, linear, pitch, depth_pitch, workers)
+            } else {
+                self.layout.detile(tiled, mip, slice, linear, pitch, depth_pitch)
+            };
+            if let Err(e) = result {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                break;
             }
         }
+        DETILE_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
