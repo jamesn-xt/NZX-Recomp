@@ -1869,10 +1869,8 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes. The
-    /// boolean is true when the list recorded a `CopyTextureRegion` reading
-    /// that staging buffer on the GPU.
-    Texture(std::sync::Arc<crate::texture::Staging>, bool),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1894,6 +1892,14 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title-written textures whose staging buffer is copied into the host
+    /// texture in this list's prelude if refreshed or not uploaded yet.
+    texture_uploads: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Staging>,
+    )>,
+    /// Staging buffers actually copied by this submission's prelude.
+    texture_copies: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2377,7 +2383,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging, _) => {
+                Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -2880,7 +2886,7 @@ mod late_tests {
 
     /// A texture staging buffer marked in flight only triggers `wait_flight`
     /// when a refresh actually detiles new contents (never on unchanged
-    /// refreshes), and skipped uploads record `uploads = false`.
+    /// refreshes), and only actual prelude copies are marked in flight.
     #[test]
     fn staging_wait_only_runs_on_detile_and_real_uploads() {
         let Some(host) = super::host() else { return };
@@ -2919,23 +2925,15 @@ mod late_tests {
         let tex = crate::resource::host_resource(resource).expect("host texture");
         let list1 = host.new_list().expect("host list 1");
         crate::texture::upload(&list1, resource, tex);
-        let (staging, uploads1) = list1
-            .deferred()
-            .copies
-            .iter()
-            .find_map(|step| match step {
-                super::Step::Texture(s, u) => Some((s.clone(), *u)),
-                _ => None,
-            })
-            .expect("texture step on first upload");
-        assert!(uploads1, "first upload must record CopyTextureRegion");
-        // Initial refresh detiles (leaving dirty=true after defer_host ran first).
+        let staging = list1.deferred().texture_uploads[0].1.clone();
+        // Initial refresh detiles; the prelude selects the first upload.
         let mut waited = Vec::new();
         let mut batch = super::Batch::default();
         list1.run_deferred(&mut batch, &mut |need| waited.push(need));
         assert!(waited.is_empty(), "no flight in progress yet");
-        // Second list runs with unchanged memory so defer_host clears dirty=false
-        // and refresh does not detile.
+        let _ = list1.prelude();
+        assert_eq!(list1.deferred().texture_copies.len(), 1);
+        // An unchanged submission needs no staging copy.
         let list2 = host.new_list().expect("host list 2");
         crate::texture::upload(&list2, resource, tex);
         let mut batch2 = super::Batch::default();
@@ -2943,19 +2941,15 @@ mod late_tests {
         assert!(waited.is_empty());
         // Mark staging in flight for submission 10.
         staging.mark_in_flight(10);
-        // Third upload skips CopyTextureRegion (uploaded && !dirty) -> uploads=false.
+        let _ = list2.prelude();
+        assert!(list2.deferred().texture_copies.is_empty());
+        // A third clean submission likewise selects no copy.
         let list3 = host.new_list().expect("host list 3");
         crate::texture::upload(&list3, resource, tex);
-        let uploads3 = list3
-            .deferred()
-            .copies
-            .iter()
-            .find_map(|step| match step {
-                super::Step::Texture(_, u) => Some(*u),
-                _ => None,
-            })
-            .expect("texture step on third upload");
-        assert!(!uploads3, "clean texture must skip CopyTextureRegion");
+        let mut batch3 = super::Batch::default();
+        list3.run_deferred(&mut batch3, &mut |need| waited.push(need));
+        let _ = list3.prelude();
+        assert!(list3.deferred().texture_copies.is_empty());
         // Unchanged refresh must NOT wait even though in_flight == 10.
         staging.refresh(&mut |need| waited.push(need));
         assert!(waited.is_empty(), "unchanged refresh must not wait: {waited:?}");
@@ -4589,10 +4583,8 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Texture(staging, true) = step {
-                        staging.mark_in_flight(this_submission);
-                    }
+                for staging in &list.deferred().texture_copies {
+                    staging.mark_in_flight(this_submission);
                 }
             }
             *submitted += 1;
@@ -5294,11 +5286,37 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
+    /// from the other, if a list submitted earlier left it behind. For
+    /// title-written textures whose staging buffer was refreshed (or has
+    /// not been uploaded yet) it copies the staging buffer into the host
+    /// texture before the list uses it.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // `run_deferred` has already refreshed each staging buffer, so we
+        // know here exactly which textures need a GPU copy on this submission.
+        let uploads: Vec<_> = {
+            let mut deferred = self.deferred();
+            deferred.texture_copies.clear();
+            let uploads: Vec<_> = deferred
+                .texture_uploads
+                .iter()
+                .filter_map(|(copy, staging)| {
+                    if staging.take_upload() {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+                        Some((copy.clone(), staging.clone()))
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                        None
+                    }
+                })
+                .collect();
+            deferred.texture_copies.extend(uploads.iter().map(|(_, staging)| staging.clone()));
+            uploads
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -5350,13 +5368,35 @@ impl HostList {
                 }
             }
         }
+        for (copy, _) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(
+                    &copy.texture,
+                    host_state(real),
+                    host_state(COPY_DEST),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
+                        &copy.texture,
+                        host_state(COPY_DEST),
+                        host_state(real),
+                    ));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5376,6 +5416,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (copy, staging) in &uploads {
+                    staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5445,6 +5488,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.texture_uploads.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty())
             {
@@ -5684,14 +5728,23 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset. `uploads` is
-    /// true when this list recorded a `CopyTextureRegion` reading `staging`.
+    /// submitted, keeping it alive until the list is reset. Actual GPU
+    /// copies are selected by the prelude after these refreshes.
     pub(crate) fn defer_texture(
         &self,
         staging: std::sync::Arc<crate::texture::Staging>,
-        uploads: bool,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, uploads));
+        self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Copies `staging` into `copy` in this list's prelude when submitted,
+    /// if `staging` has not been uploaded yet or was detiled by `refresh`.
+    pub(crate) fn defer_texture_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().texture_uploads.push((copy, staging));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5769,7 +5822,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging, _) => {
+                Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh(wait_flight);
                     }
