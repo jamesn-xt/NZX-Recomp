@@ -113,3 +113,22 @@ that the full workspace suite was rerun on this child revision. The executable
 SHA-256 is `A6A3DE82020241AD3D39C221C5CA60B047C90D0D9FC0096B972AF2404D71BCF0`.
 Its bounded title run is in progress. These tests do not establish that a
 particular title draw reaches the sampler race or that all flicker is fixed.
+
+That bounded title run has now completed (720-second guard, intentional exit).
+With in-flight fetch enabled, seconds 420–500 contained 16 caption samples:
+median **192.6 ms / 5.19 fps**, sampled p95 213.0 ms, roughly 4,380–4,510 draws.
+After the same backward/camera inputs, seconds 580–620 contained seven samples:
+median **192.1 ms / 5.21 fps**, sampled p95 211.8 ms, roughly 5,430–5,470 draws,
+and 19.34 GiB private memory. No builds or GPU tests overlapped these windows.
+
+Clothing, room surfaces, bunks, cellmates and window mesh remained visible. A
+guard later appeared and a follow-guard instruction was shown; this is limited
+story progression evidence, not mission completion. No device loss or process
+crash was observed before the intentional guard stop. Visual defects remain.
+The comparisons still have camera/scene differences, and **30 fps is not met**.
+
+The timing probe found the slot stage at about 39–45 ms in observed window
+lines: about 7–8 ms planning and 32–38 ms mirroring. Copy preparation, submission
+waits and GPU work remain material costs; overlapping timers must not be added
+as independent frame costs. These measurements guide further work rather than
+establishing a guaranteed improvement for other machines or scenes.
