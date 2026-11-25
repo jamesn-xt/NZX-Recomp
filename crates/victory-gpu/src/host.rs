@@ -1477,6 +1477,9 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Whether `pso` is the wide form of the compare
+    /// ([`crate::card_hash`]): a group per piece, not a thread.
+    wide: bool,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -3055,25 +3058,43 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
+        let compile = |source: &str| -> windows::core::Result<ID3DBlob> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out
+            // pointer is ours.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    windows::core::s!("card compare"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        // The wide form if asked for; the narrow one if it was not, or if
+        // the wide one does not compile here (copies in the card's memory
+        // hang on the compare, so it must not be lost to the switch).
+        let wide = crate::card_hash::wide()
+            .then(|| compile(crate::card_hash::CARD_COMPARE_WIDE))
+            .and_then(|made| {
+                made.map_err(|e| tracing::warn!(error = %e, "the wide card compare did not compile: the narrow one is used"))
+                    .ok()
+            });
+        let (code, wide) = match wide {
+            Some(code) => (code, true),
+            None => (compile(CARD_COMPARE)?, false),
+        };
+        if wide {
+            tracing::info!("card compare: a group per piece (VICTORY_CARD_HASH_WIDE)");
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3099,6 +3120,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                wide,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3227,7 +3249,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = crate::card_hash::groups(run.pieces, work.wide);
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     list.Close()?;
@@ -3312,7 +3335,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = crate::card_hash::groups(r.span.pieces, work.wide);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
