@@ -182,7 +182,8 @@ impl<C: Clone> Picked<C> {
 
     /// Slot `slot` (with `record`, naming table entry `entry`) reads title
     /// memory `[from, to)` through host copy `copy` (`key`: its identity).
-    pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>) {
+    pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, span: std::ops::Range<u64>, record: Record, entry: Option<u32>) {
+        let (from, to) = (span.start, span.end);
         self.forget(slot);
         self.note_entry(slot, entry);
         self.slots.insert(slot, Slot { copy: key, from, to, record });
@@ -294,7 +295,7 @@ mod tests {
             };
             let copy = slot / 4;
             let from = u64::from(slot) * 16;
-            p.keep(slot, copy as usize, &copy, from, from + 16, record, entry(record));
+            p.keep(slot, copy as usize, &copy, from..from + 16, record, entry(record));
         }
         due
     }
@@ -352,7 +353,7 @@ mod tests {
         let mut p: Picked<u32> = Picked::new(false);
         let _ = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
         for s in 0..3 {
-            p.keep(s, 0, &0, 0, 16, heap.record(s).unwrap(), None);
+            p.keep(s, 0, &0, 0..16, heap.record(s).unwrap(), None);
         }
         p.orphan(3, heap.record(3).unwrap(), None);
         for n in 1..FULL_EVERY {

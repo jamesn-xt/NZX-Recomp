@@ -1438,7 +1438,7 @@ impl State {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            ranges.keep(index, key, &shadow, address, address + len, record, entry);
+            ranges.keep(index, key, &shadow, address..address + len, record, entry);
         }
         let views = ranges.views() as u32;
         let looked = started.elapsed();
