@@ -92,50 +92,6 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
-    pub(super) fn writes_depth_only(&self) -> bool {
-        self.targets.NumRenderTargets == 0
-            && self.depth_format != DXGI_FORMAT_UNKNOWN
-            && self.depth.DepthEnable.as_bool()
-            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
-    }
-
-    /// The guest color buffer bypasses its blender for integer surfaces,
-    /// even when the draw asks for blending. D3D12 validates blend enable
-    /// against every active target format when the pipeline is created.
-    pub(crate) fn apply_integer_blend_bypass(&mut self) {
-        let integer = |f: &DXGI_FORMAT| matches!(
-            *f,
-            DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
-                | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
-                | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
-                | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
-                | DXGI_FORMAT_R10G10B10A2_UINT
-                | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
-                | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
-                | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
-                | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
-                | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
-                | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
-        );
-        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
-        if !self.blend.IndependentBlendEnable.as_bool() {
-            let shared = self.blend.RenderTarget[0];
-            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
-                return;
-            }
-            // With shared blending D3D12 reads slot zero for every target.
-            // Expand it before overriding individual targets, including
-            // their shared write mask.
-            self.blend.RenderTarget[..formats.len()].fill(shared);
-            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
-        }
-        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
-            if integer(format) {
-                target.BlendEnable = false.into();
-            }
-        }
-    }
-
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -480,7 +436,6 @@ impl HostPipeline {
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
-                            || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -1026,42 +981,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {
-        let mut g = GraphicsState::default();
-        g.targets.NumRenderTargets = 3;
-        g.targets.RTFormats[..3].copy_from_slice(&[
-            DXGI_FORMAT_R32_FLOAT,
-            DXGI_FORMAT_B4G4R4A4_UNORM,
-            DXGI_FORMAT_R8_UINT,
-        ]);
-        g.blend.IndependentBlendEnable = true.into();
-        for (i, target) in g.blend.RenderTarget[..3].iter_mut().enumerate() {
-            target.BlendEnable = true.into();
-            target.BlendOp = D3D12_BLEND_OP_MAX;
-            target.RenderTargetWriteMask = [15, 15, 1][i];
-        }
-        let before = g.blend;
-        g.apply_integer_blend_bypass();
-        assert_eq!(g.blend.RenderTarget[0..2], before.RenderTarget[0..2]);
-        let mut expected = before.RenderTarget[2];
-        expected.BlendEnable = false.into();
-        assert_eq!(g.blend.RenderTarget[2], expected);
-
-        g.blend = before;
-        g.blend.IndependentBlendEnable = false.into();
-        g.blend.RenderTarget[0].RenderTargetWriteMask = 3;
-        g.targets.RTFormats.swap(0, 2);
-        g.apply_integer_blend_bypass();
-        assert!(g.blend.IndependentBlendEnable.as_bool());
-        assert!(!g.blend.RenderTarget[0].BlendEnable.as_bool());
-        for target in &g.blend.RenderTarget[1..3] {
-            assert!(target.BlendEnable.as_bool());
-            assert_eq!(target.BlendOp, D3D12_BLEND_OP_MAX);
-            assert_eq!(target.RenderTargetWriteMask, 3);
-        }
-    }
-
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1156,22 +1075,6 @@ mod tests {
         };
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
-            return;
-        }
-        // The software adapter says it takes the test and draws through it
-        // all the same (depth 0.5 passes bounds of [0.6, 1.0]): the test is
-        // for a card. A run that asked for the software adapter skips it, as
-        // before. A runner whose only device is software skips it when the
-        // CI-only variable asks; a desk that did not ask for the software
-        // adapter and has no card still fails here, as it should.
-        if crate::host::on_warp() {
-            eprintln!("the software adapter does not apply depth bounds; skipped");
-            return;
-        }
-        if host.is_software()
-            && std::env::var("VICTORY_TESTS_ALLOW_SOFTWARE_SKIP").is_ok_and(|v| v == "1")
-        {
-            eprintln!("the software adapter does not apply depth bounds; skipped (VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1)");
             return;
         }
         let Some(dxc) = dxc() else {

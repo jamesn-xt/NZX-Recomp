@@ -27,6 +27,9 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
+/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
+const EXCEPTIONS: &[(&str, &str)] = &[];
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -46,6 +49,9 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
     for path in &files {
+        if EXCEPTIONS.iter().any(|(p, _)| p == path) {
+            continue;
+        }
         let content = if staged {
             let out = Command::new("git")
                 .args(["show", &format!(":{path}")])

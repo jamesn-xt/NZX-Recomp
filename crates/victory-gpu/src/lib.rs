@@ -17,11 +17,11 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(any(windows, test))]
+mod card_hash;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-#[cfg(windows)]
-mod debug_hud;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -29,8 +29,12 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heap_pass;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod over;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -52,15 +56,13 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
-#[cfg(windows)]
-mod writeback;
-#[cfg(windows)]
-mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -68,7 +70,6 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_bytes_written, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };

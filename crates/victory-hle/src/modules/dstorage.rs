@@ -974,10 +974,13 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The separately supplied format tables next to the runtime executable.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    let executable = std::env::current_exe().map_err(|e| format!("runtime path: {e}"))?;
+    let path = executable.with_file_name("bcpack-tables.bin");
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}; run Initialize-FormatTables.ps1 to prepare the file", path.display()))?;
+    Tables::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.
@@ -1051,30 +1054,62 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        // Opens the guarded blocks and tells the GPU side a placed texture
+        // there changes. `fill` writes from user mode (a file read is read
+        // beside first, see `execute`), so a block guarded again meanwhile
+        // faults into the guard instead of failing the write.
+        victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill_virtual_destination(out, fill, victory_gpu::title_bytes_written);
+        let filled = fill(out).map(drop);
+        // Said again now that the bytes are there (upstream's c75fdba holds
+        // the blocks open over the read and marks them once more at its
+        // end): a copy or a texture pass that took the memory while the
+        // read was under way took what was there before. Counted; acted on
+        // only with `VICTORY_PAGE_WRITES=all`.
+        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
+    // SAFETY: the title passes a page number per 64 KiB of destination,
+    // which holds at least `len` bytes from `offset`.
+    let pages = unsafe {
+        std::slice::from_raw_parts(
+            request.destination.cast::<usize>(),
+            (offset + len).div_ceil(PAGE),
+        )
+    };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        // The title maps pages where the card reads them and has them
+        // filled afterwards: the GPU side's copies of those addresses
+        // learn of the bytes only from this (upstream c75fdba, fork PR
+        // #571). After a decode that failed part way too: what it wrote
+        // is there.
+        super::xmem::pages_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
+    // A page the title has just made, or a view the host refuses for a
+    // moment, comes right a little later: the write is tried again before
+    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
+    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
+    // reads a launch here, all in one second of the loading; the one build
+    // that tried again (run 165) lost none of 13.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
     });
+    // Since the start: writes that succeeded on a later try, and writes
+    // given up.
+    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
+    let mut tries = 0u32;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
@@ -1082,12 +1117,28 @@ fn into_destination(
     }
     if written {
         if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                offset,
+                len,
+                tries,
+                on_a_retry,
+                given_up = RETRIED[1].load(Ordering::Relaxed),
+                "dstorage: a destination's physical pages written after a retry"
+            );
         }
+        // As above, after the write that succeeded.
+        super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            known = super::xmem::pages_known(pages, offset, len),
+            tries,
+            given_up,
+            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1096,62 +1147,10 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
-            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
-            options = format_args!("{:#x}", request.options),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
     }
-}
-
-/// Open any guards before the write. After the producer succeeds, publish its
-/// completed extent before the queue signals completion to the title.
-fn fill_virtual_destination(
-    out: &mut [u8],
-    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
-    publish: impl FnOnce(&[u8]),
-) -> Result<(), HRESULT> {
-    victory_gpu::kernel_will_write(out.as_ptr() as usize, out.len());
-    let produced = fill(out)?;
-    let written = out.get(..produced).ok_or(INVALID_DATA)?;
-    if !written.is_empty() {
-        publish(written);
-    }
-    Ok(())
-}
-
-/// The page numbers of a destination. The title fills the array after it
-/// enqueued the request (a copy taken then holds zeros, or the numbers of
-/// the array's last use), so it is read when the request runs; a number
-/// that is still zero then is waited for, a tenth of a second at most.
-fn filled(array: *const usize, n: usize) -> Vec<usize> {
-    static LATE: AtomicU64 = AtomicU64::new(0);
-    let read = || -> Vec<usize> {
-        // SAFETY: the title passes a page number per 64 KiB of destination
-        // and keeps the array until the request completes; it may write it
-        // from another thread meanwhile.
-        (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
-    };
-    let mut pages = read();
-    if !pages.contains(&0) {
-        return pages;
-    }
-    let began = std::time::Instant::now();
-    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        pages = read();
-    }
-    let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
-    if late <= 8 || late.is_power_of_two() {
-        tracing::warn!(
-            requests = late,
-            pages = n,
-            waited_ms = began.elapsed().as_millis() as u64,
-            filled = !pages.contains(&0),
-            "dstorage: a request ran before its page array was filled"
-        );
-    }
-    pages
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1305,20 +1304,6 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
-    }
-
-    #[test]
-    fn a_page_array_filled_late_is_waited_for() {
-        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
-        let title = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            array[1].store(8, Ordering::Release);
-        });
-        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
-        title.join().unwrap();
-        // One never filled is given up on.
-        array[0].store(0, Ordering::Release);
-        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
     }
 
     #[test]
@@ -1636,33 +1621,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
-    }
-
-    #[test]
-    fn virtual_destination_publishes_only_completed_bytes() {
-        use std::cell::Cell;
-        let mut destination = [0xcc; 8];
-        let start = destination.as_ptr();
-        let published = Cell::new(false);
-        fill_virtual_destination(
-            &mut destination,
-            |out| {
-                assert!(!published.get());
-                out[..3].copy_from_slice(b"rgb");
-                Ok(3)
-            },
-            |bytes| {
-                assert_eq!(bytes.as_ptr(), start);
-                assert_eq!(bytes, b"rgb");
-                published.set(true);
-            },
-        ).unwrap();
-        assert!(published.get());
-        assert_eq!(destination[3..], [0xcc; 5]);
-        for result in [Err(INVALID_DATA), Ok(0), Ok(9)] {
-            let answer = fill_virtual_destination(&mut destination, |_| result, |_| panic!("no completed bytes"));
-            assert_eq!(answer, if result == Ok(0) { Ok(()) } else { Err(INVALID_DATA) });
-        }
     }
 
     #[test]

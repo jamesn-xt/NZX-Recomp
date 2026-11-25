@@ -24,9 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, GetCurrentThreadId, GetCurrentThreadStackLimits,
-};
+use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -73,21 +71,14 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    let Some(file) = LOG.get() else { return };
-    append_record(file, text);
-}
-
-fn append_record(file: &std::path::Path, text: &str) {
     use std::io::Write;
+    let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
     if let Ok(mut f) = opened {
-        // Submit a complete record in one append. Concurrent exceptions can
-        // interleave the separate writes made by formatting into the file.
-        let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
-        let _ = f.write_all(record.as_bytes());
+        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
     }
 }
 
@@ -488,11 +479,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         text.push_str(&l);
         text.push('\n');
     };
-    // SAFETY: these identify the calling (faulting) thread.
-    let (tid, thread) = unsafe { (GetCurrentThreadId(), GetCurrentThread()) };
-    let name = crate::threads::thread_name(thread);
     line(format!(
-        "VIctory: {what} {:#010x} at {}{detail} on thread {tid} {name:?}",
+        "VIctory: {what} {:#010x} at {}{detail}",
         code as u32,
         locate(at)
     ));
@@ -628,8 +616,11 @@ fn module_of(address: usize) -> Option<String> {
     Some(format!("{name}+{:#x}", address - module as usize))
 }
 
-/// What the address space manager reports at `address` when it is queried.
-/// A reserved region may have been decommitted or unmapped earlier.
+/// What is at `address`, for an access violation there: nothing, memory
+/// reserved but never committed, a guard page, or the protection the access
+/// broke (with the module, for an image's pages). Each points at a different
+/// cause: a wild pointer, an allocation whose commit failed, a stack
+/// overrun, a write to code or constants.
 fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
@@ -647,14 +638,7 @@ fn memory_at(address: usize) -> String {
     }
     let protect = match info.State {
         MEM_FREE => return "nothing mapped there".into(),
-        MEM_RESERVE => {
-            let start = info.BaseAddress as usize;
-            let end = start.saturating_add(info.RegionSize);
-            return format!(
-                "reserved, currently uncommitted; queried span {start:#x}..{end:#x}, allocation {:#x}",
-                info.AllocationBase as usize
-            );
-        }
+        MEM_RESERVE => return "reserved, never committed".into(),
         _ if info.Protect & PAGE_GUARD != 0 => return "a guard page".into(),
         _ => match info.Protect & 0xff {
             PAGE_NOACCESS => "no access".into(),
@@ -704,39 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_crash_records_stay_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("crashes.log");
-        let start = std::sync::Barrier::new(4);
-        std::thread::scope(|scope| {
-            for tid in 0..4 {
-                let (file, start) = (&file, &start);
-                scope.spawn(move || {
-                    start.wait();
-                    for seq in 0..16 {
-                        append_record(file, &format!("begin {tid} {seq}\nend {tid} {seq}"));
-                    }
-                });
-            }
-        });
-        let log = std::fs::read_to_string(file).unwrap();
-        let lines: Vec<_> = log.lines().collect();
-        assert_eq!(lines.len(), 4 * 16 * 3);
-        for record in lines.chunks_exact(3) {
-            assert!(record[0].starts_with("unix time "));
-            assert!(record[0].ends_with(&format!(", process {}", std::process::id())));
-            assert_eq!(
-                record[1].strip_prefix("begin ").unwrap(),
-                record[2].strip_prefix("end ").unwrap()
-            );
-        }
-    }
-
-    #[test]
     fn memory_at_names_what_an_access_hit() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS,
-            PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
         // SAFETY: reserves four pages of ours and commits three of them;
         // nothing reads or writes them.
@@ -752,16 +707,10 @@ mod tests {
             page(3, PAGE_NOACCESS);
             base as usize
         };
-        let reserved = |start: usize, end: usize| {
-            format!("reserved, currently uncommitted; queried span {start:#x}..{end:#x}, allocation {base:#x}")
-        };
-        assert_eq!(memory_at(base + 8), reserved(base, base + 0x1000));
+        assert_eq!(memory_at(base + 8), "reserved, never committed");
         assert_eq!(memory_at(base + 0x1008), "read-only");
         assert_eq!(memory_at(base + 0x2008), "a guard page");
         assert_eq!(memory_at(base + 0x3008), "no access");
-        // SAFETY: decommits just the second page in our reservation.
-        unsafe { assert_ne!(VirtualFree((base + 0x1000) as *mut _, 0x1000, MEM_DECOMMIT), 0) };
-        assert_eq!(memory_at(base + 0x1008), reserved(base + 0x1000, base + 0x2000));
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
         assert_eq!(memory_at(base + 8), "nothing mapped there");

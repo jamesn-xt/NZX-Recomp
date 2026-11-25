@@ -10,7 +10,7 @@
 //! dictionary that stands in for blocks -1 to -255) and the residuals of the
 //! endpoints and indices against them. The models, the index rank tables,
 //! the BC7 control codes and the dictionaries are constants of the format,
-//! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
+//! supplied in a separate `bcpack-tables.bin` file.
 
 use std::fmt;
 
@@ -119,7 +119,8 @@ impl Reader<'_> {
 }
 
 impl Tables {
-    /// The tables VIctory ships with.
+    /// The verified local format tables used by decoder tests.
+    #[cfg(test)]
     pub fn builtin() -> Result<Tables, Error> {
         Tables::parse(include_bytes!("bcpack-tables.bin"))
     }

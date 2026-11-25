@@ -38,7 +38,6 @@ static SERIES_S: AtomicBool = AtomicBool::new(false);
 
 /// Set before the title starts.
 pub fn set(console: Console) {
-    victory_formats::texture::set_series_s_tiling(console == Console::SeriesS);
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
 }
 

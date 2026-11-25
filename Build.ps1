@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory = (Join-Path $env:LOCALAPPDATA 'NZX Recomp'),
-    [string]$GamePath
+    [string]$OutputDirectory = (Join-Path $env:LOCALAPPDATA 'NZX Recomp')
 )
 $ErrorActionPreference = 'Stop'
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -10,11 +9,7 @@ for ($parent = [IO.DirectoryInfo]::new($OutputDirectory); $parent; $parent = $pa
         throw 'Choose an output directory outside the source checkout.'
     }
 }
-if ($GamePath) {
-    $GamePath = (Resolve-Path -LiteralPath $GamePath).Path
-    if (!(Test-Path -LiteralPath $GamePath -PathType Leaf)) { throw 'GamePath must be a file.' }
-}
-$names = @('nzx-recomp.exe', 'nzx-play.exe', 'nzx-warm.exe')
+$names = @('nzx-recomp.exe')
 foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
     if ($process.Path -and $names -contains [IO.Path]::GetFileName($process.Path) -and
         [IO.Path]::GetDirectoryName($process.Path) -eq $OutputDirectory) {
@@ -23,7 +18,6 @@ foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
 }
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1')
     & cargo build --locked --release -p victory --features diagnostics --bins
     if ($LASTEXITCODE -ne 0) { throw 'NZX Recomp build failed.' }
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
@@ -32,13 +26,11 @@ try {
         if (!(Test-Path -LiteralPath (Join-Path $release $name))) { throw "Build output missing: $name" }
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1') -Destination (Join-Path $OutputDirectory 'bcpack-tables.bin')
     foreach ($name in $names) {
         Copy-Item -LiteralPath (Join-Path $release $name) -Destination (Join-Path $OutputDirectory $name)
     }
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE') -Destination $OutputDirectory
-    if ($GamePath) {
-        Set-Content -LiteralPath (Join-Path $OutputDirectory 'game-path.txt') -Value $GamePath -Encoding utf8
-    }
+    Copy-Item -LiteralPath @((Join-Path $PSScriptRoot 'LICENSE'), (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1'), (Join-Path $PSScriptRoot 'scripts/Launch-PerformanceProfile.ps1'), (Join-Path $PSScriptRoot 'victory.example.toml')) -Destination $OutputDirectory
 } finally { Pop-Location }
 Write-Host "Built NZX Recomp in $OutputDirectory"
-Write-Host 'Open nzx-play.exe to play or nzx-warm.exe to preload shaders.'
+Write-Host 'Use Launch-PerformanceProfile.ps1 to run the Series S profile.'

@@ -84,17 +84,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-    },
-    /// Translate the shaders of a title's archives into the cache and make
-    /// their compute pipelines, so that a run finds them there.
-    Warm {
-        paths: Vec<PathBuf>,
-        /// Worker threads (default: every logical core).
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
-        jobs: Option<usize>,
-        /// Only translate: no host pipelines.
-        #[arg(long)]
-        no_pipelines: bool,
+        warm: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -163,6 +159,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -172,9 +169,11 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            if let Some(file) = warm {
+                return translate::warm(paths, &file, jobs);
+            }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
             exe,
             unimplemented,
@@ -182,15 +181,7 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => {
-            let result = run::run(&exe, unimplemented, strict, execute, console);
-            // The process's own end, as `main`'s Result maps it: Ok is 0,
-            // Err is 1. A title that ends the process itself logs its own
-            // line and never returns here.
-            let code = if result.is_ok() { 0 } else { 1 };
-            tracing::info!("runtime exit: code {code}");
-            result
-        }
+        } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
 }

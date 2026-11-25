@@ -8,9 +8,11 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. The reference batches use a
-//! stand-in under the node reader (`lower::intersect::TEST_MEMORY`). The
-//! reflected-ray test binds an actual root page directory and fault UAV.
+//! the node pointer or in the descriptor. These tests have no host that
+//! keeps copies of title memory and their directory, so for the second
+//! they put a stand-in under the node reader
+//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
+//! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -160,23 +162,13 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    build_words(&program(wide, descriptor))
-}
-
-fn build_words(words: &[u32]) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(words);
-    build_compute_shader(&native)
-}
-
-pub(super) fn build_compute_shader(
-    native: &NativeProgram,
-) -> Result<(HostShader, resource::Resources), ShaderError> {
+    let native = native(&program(wide, descriptor));
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, native).expect("io::raise");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native,
+        native: &native,
         p: &p,
         st: &st,
         io: &io,
@@ -195,8 +187,6 @@ pub(super) fn build_compute_shader(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
-        written_root_uavs: lowered.written_root_uavs,
-        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -596,80 +586,6 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
 }
 
 #[test]
-fn warp_ray_probe_distinguishes_active_visits_and_finite_triangle_candidates() {
-    let (normal, _) = build(true, Descriptor::Table).unwrap();
-    let (instrumented, _) = super::with_ray_probe(|| build(true, Descriptor::Table)).unwrap();
-    assert_ne!(instrumented.dxil, normal.dxil);
-    assert_eq!(build(true, Descriptor::Table).unwrap().0.dxil, normal.dxil);
-    assert_eq!(instrumented.root_uavs, [super::SLOT_FAULTS]);
-
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let host = Host::new(true).expect("WARP is required to validate the probe");
-    let (root, pso) = host.compute_pipeline(&instrumented).unwrap();
-    let mut scene = Scene::new();
-    let triangle = scene.add(
-        nodes::triangles(&[[0., 2., 5.], [2., -2., 5.], [-2., -2., 5.]], 9),
-        16,
-    );
-    let ray = Ray::new([0.; 3], [0., 0., 1.], 20.);
-    let outside = Ray::new([5., 0., 0.], ray.direction, ray.extent);
-    let too_short = Ray::new(ray.origin, ray.direction, 2.);
-    for hits in [2, 1, 0] {
-        let cases = [
-            None,
-            Some((triangle, 0, outside)),
-            Some((triangle, 0, too_short)),
-            (hits >= 1).then_some((triangle, 0, ray)),
-            Some((triangle, 6, ray)),
-            (hits >= 2).then_some((triangle, 0, ray)),
-        ];
-        let input = buffer(&scene, &cases, u64::from(NODES));
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(vec![0; 5])), (1, Root::Uav(1))],
-                    views: &[
-                        View::Buffer {
-                            data: &input,
-                            stride: Stride::Raw,
-                        },
-                        View::RawUav(4 * THREADS),
-                        View::RawUav(super::MEMORY_FAULTS + super::RAY_PROBE_DWORDS),
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap();
-        for (i, case) in cases.iter().enumerate() {
-            assert_eq!(&out[0][4 * i..4 * i + 4], expected(&scene, case, true));
-        }
-        let stats = &out[1][super::MEMORY_FAULTS as usize..];
-        assert_eq!(stats[..2], [3 + hits, hits]);
-        if hits > 0 {
-            let result = expected(&scene, &cases[3], true);
-            assert_eq!(
-                stats[2..],
-                [
-                    NODES >> 3,
-                    0,
-                    5f32.to_bits(),
-                    20f32.to_bits(),
-                    result[2],
-                    result[3]
-                ]
-            );
-        } else {
-            assert_eq!(stats[2..], [0; 6]);
-        }
-    }
-}
-
-#[test]
 fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     // Pointers count from the buffer's start.
     run(true, Descriptor::Table, u64::from(NODES), true);
@@ -682,267 +598,6 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 #[test]
 fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
-}
-
-/// A secondary ray uses the previous GPU result. All node loads run through the
-/// production root-SRV page directory and its bindless raw UAV, including the
-/// negative case for a guest page without a resident copy.
-#[test]
-fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
-    use windows::Win32::Graphics::Dxgi::*;
-    const PAGE: u64 = 0x1_0002_0000;
-    const MEMORY_BASE: u32 = 2;
-    // Page zero in the host copy is padding. A guest byte's address must
-    // include the directory's start offset as well as the byte in its page.
-    const START: usize = 128;
-    let vertices = [
-        [[-1., -1., -1.], [1., -1., 1.], [0., 1., 0.]], // diagonal mirror
-        [[3., -1., -1.], [3., 1., -1.], [3., 0., 1.]],  // side mirror
-        [[-1., -1., 8.], [1., -1., 8.], [0., 1., 8.]],  // farther primary hit
-        [[-1., -1., -1.], [1., -1., -1.], [0., 1., -1.]], // nearer, unlinked
-    ];
-    let mut scene = Scene::new();
-    for triangle in &vertices {
-        scene.add(nodes::triangles(triangle, 9), 16);
-    }
-    let children = [
-        scene.pointer(2, 0),
-        scene.pointer(1, 0),
-        scene.pointer(0, 0),
-        bvh::NONE,
-    ];
-    let root_node = scene.add(
-        nodes::box32(
-            children,
-            [
-                [-1., -1., 8., 1., 1., 8.],
-                [3., -1., -1., 3., 1., 1.],
-                [-1., -1., -1., 1., 1., 1.],
-                // An unused builder slot has an invalid pointer and inverted
-                // bounds. It must sort behind every intersected child.
-                [
-                    f32::INFINITY,
-                    f32::INFINITY,
-                    f32::INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                ],
-            ],
-        ),
-        32,
-    );
-    let mut memory = vec![0u32; START / 4];
-    memory.extend_from_slice(&scene.words);
-    // At the last 64 bytes of the resident page, only the first two
-    // Box32 bounds are readable. A ray through (0,0,0) also intersects
-    // an all-zero box, so zero-filled missing bounds would invent hits.
-    let split = nodes::box32([8, 16, 24, 32], [[-1., -1., -1., 1., 1., 1.]; 4]);
-    memory.resize((START + 0x10000 - 64) / 4, 0);
-    memory.extend_from_slice(&split[..16]);
-    let page = (PAGE >> 16) as usize;
-    let mut directory = vec![0; (page + 2) * 2];
-    directory[page * 2..page * 2 + 2].copy_from_slice(&[1, START as u32]);
-    let (shader, _) = build(true, WHOLE).unwrap();
-    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
-    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
-    assert!(shader.root_cbvs.is_empty());
-    let mut constants = vec![0; shader.user_data_dwords() as usize];
-    for (dword, value) in [(0, MEMORY_BASE), (1, 3)] {
-        let word = shader.user_data.iter().find(|u|
-            u.root == RootType::Other(super::USER_MEMORY_BASE) && u.dword == dword
-        ).unwrap();
-        constants[word.index as usize] = value;
-    }
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for warp in [false, true] {
-        let Ok(host) = Host::new(warp) else { continue };
-        // SAFETY: a factory query for this live D3D12 device's adapter.
-        let desc = unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            factory
-                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
-                .unwrap()
-                .GetDesc1()
-                .unwrap()
-        };
-        let adapter = String::from_utf16_lossy(&desc.Description);
-        let adapter = adapter.trim_end_matches('\0');
-        let (root, pso) = host.compute_pipeline(&shader).unwrap();
-        let dispatch = |cases: &[Case], address: u64, directory: &[u32]| {
-            let input = buffer(&scene, cases, address);
-            host.dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    // Root signature after the constants: fault UAV u253, directory SRV t254.
-                    roots: vec![
-                        (0, Root::Constants(constants.clone())),
-                        (1, Root::Uav(3)),
-                        (
-                            2,
-                            Root::View {
-                                srv: true,
-                                data: directory.to_vec(),
-                            },
-                        ),
-                    ],
-                    views: &[
-                        View::Buffer {
-                            data: &input[..NODES as usize / 4],
-                            stride: Stride::Raw,
-                        },
-                        View::RawUav(THREADS * 4),
-                        View::RawUav(16), // zero sink for absent pages
-                        View::RawUavData(&memory),
-                        View::RawUav(super::MEMORY_FAULTS),
-                        View::RawUavData(&split[16..]),
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap()
-        };
-        let query = |cases: &[Case], address: u64| dispatch(cases, address, &directory);
-        let mut ray = Ray::new([0., 0., -2.], [0., 0., 1.], 20.);
-        let outside = Ray::new([0., 4., -2.], ray.direction, ray.extent);
-        let controls = query(&[Some((root_node, 5, outside)), Some((3, 0, ray))], PAGE);
-        assert_eq!(controls[0][..4], [bvh::NONE; 4], "outside all boxes");
-        assert_eq!(
-            f32::from_bits(controls[0][4]) / f32::from_bits(controls[0][5]),
-            1.,
-            "the unlinked leaf really intersects"
-        );
-        let absent = query(&[Some((0, 0, ray))], PAGE + (1 << 16));
-        assert_eq!(absent[0][..4], bvh::MISS.map(f32::to_bits));
-        let through_origin = Ray::new([-2.; 3], [1.; 3], 20.);
-        let absent_boxes = query(
-            &[Some((0, 4, through_origin)), Some((0, 5, through_origin))],
-            PAGE + (1 << 16),
-        );
-        assert_eq!(
-            absent_boxes[0][..8],
-            [bvh::NONE; 8],
-            "{adapter}: missing box page"
-        );
-        let split_box = query(&[Some((0, 5, through_origin))], PAGE + 0x10000 - 64);
-        assert_eq!(
-            split_box[0][..4],
-            [8, 16, bvh::NONE, bvh::NONE],
-            "{adapter}: preserve only the children whose bounds are resident"
-        );
-        let fault_slot = 1 + (page + 1) % (super::MEMORY_FAULTS as usize - 1);
-        assert_eq!(
-            absent[3][fault_slot],
-            page as u32 + 1,
-            "missing page reported"
-        );
-        assert_eq!(split_box[3][fault_slot], page as u32 + 1);
-        let mut recovered = directory.clone();
-        // Another recording thread mapped this page after our descriptor
-        // run was bound. The old bind must fault without indexing that slot.
-        recovered[(page + 1) * 2] = 1024;
-        let beyond = dispatch(&[Some((0, 5, through_origin))], PAGE + 0x10000 - 64, &recovered);
-        assert_eq!(beyond[0][..4], split_box[0][..4]);
-        assert_eq!(beyond[3][fault_slot], page as u32 + 1);
-        recovered[(page + 1) * 2] = 3; // separate host buffer for the remaining bounds
-        let retried = dispatch(
-            &[Some((0, 5, through_origin))],
-            PAGE + 0x10000 - 64,
-            &recovered,
-        );
-        assert_eq!(
-            retried[0][..4],
-            [8, 16, 24, 32],
-            "{adapter}: page became resident"
-        );
-        assert_eq!(retried[3][fault_slot], 0);
-        for (step, expected) in [Some((0, 2.)), Some((1, 3.)), Some((0, 3.)), None]
-            .into_iter()
-            .enumerate()
-        {
-            let boxes = query(&[Some((root_node, 5, ray))], PAGE);
-            if step == 0 {
-                assert_eq!(
-                    boxes[0][..4],
-                    [children[2], children[0], bvh::NONE, bvh::NONE],
-                    "{adapter}: traversal must reach both hits before the first empty slot"
-                );
-            }
-            let mut leaves = Vec::new();
-            for &child in &boxes[0][..4] {
-                if child == bvh::NONE {
-                    continue;
-                }
-                let id = (0..vertices.len())
-                    .find(|&i| scene.pointer(i, 0) == child)
-                    .expect("linked leaf pointer");
-                leaves.push(id);
-            }
-            if step == 0 {
-                assert_eq!(
-                    leaves,
-                    [0, 2],
-                    "GPU sorts both primary candidates nearest first"
-                );
-            }
-            let cases: Vec<_> = leaves.iter().map(|&i| Some((i, 0, ray))).collect();
-            let tri = query(&cases, PAGE);
-            assert!(
-                tri[3][1..].iter().all(|&p| p == 0),
-                "resident rays should not fault"
-            );
-            let mut hits = Vec::new();
-            for (&id, words) in leaves.iter().zip(tri[0].chunks_exact(4)) {
-                let [t, det, u, v] = <[u32; 4]>::try_from(words).unwrap().map(f32::from_bits);
-                let distance = t / det;
-                if distance > 1e-4 && distance <= ray.extent {
-                    hits.push((id, distance, u / det, v / det));
-                }
-            }
-            if step == 0 {
-                assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [2., 10.]);
-            }
-            let nearest = hits.into_iter().min_by(|a, b| a.1.total_cmp(&b.1));
-            assert_eq!(
-                nearest.map(|h| (h.0, h.1)),
-                expected,
-                "{adapter}, bounce {step}"
-            );
-            eprintln!(
-                "{adapter}, bounce {step}: {:?}",
-                nearest.map(|h| (h.0, h.1))
-            );
-            let Some((id, distance, u, v)) = nearest else {
-                break;
-            };
-            let [a, b, c] = vertices[id];
-            let ab: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
-            let ac: [f32; 3] = std::array::from_fn(|i| c[i] - a[i]);
-            let hit = std::array::from_fn(|i| a[i] + u * ab[i] + v * ac[i]);
-            assert_eq!(
-                hit,
-                std::array::from_fn(|i| ray.origin[i] + distance * ray.direction[i])
-            );
-            let normal: [f32; 3] = std::array::from_fn(|i| {
-                ab[(i + 1) % 3] * ac[(i + 2) % 3] - ab[(i + 2) % 3] * ac[(i + 1) % 3]
-            });
-            let dot =
-                |a: [f32; 3], b: [f32; 3]| a.into_iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
-            let factor = 2. * dot(ray.direction, normal) / dot(normal, normal);
-            ray = Ray::new(
-                hit,
-                std::array::from_fn(|i| ray.direction[i] - factor * normal[i]),
-                ray.extent,
-            );
-        }
-        ran += 1;
-    }
-    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
@@ -1000,24 +655,6 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
-        assert!(!shader.writes_guest_memory);
-    }
-}
-
-#[test]
-fn raw_guest_writes_include_stores_and_both_atomic_implementations() {
-    // global_store_dword, global_atomic_add, and global_atomic_fmin (compare-exchange loop).
-    for opcode in [0x1c, 0x32, 0x3f] {
-        let mut words = program(true, WHOLE);
-        let end = words.pop().unwrap();
-        // v[1:2] holds a 64-bit address loaded from a buffer. Write v13.
-        words.extend([
-            (0x37 << 26) | (opcode << 18) | (2 << 14),
-            (125 << 16) | (13 << 8) | 1,
-            end,
-        ]);
-        let (shader, _) = build_words(&words).unwrap();
-        assert!(shader.writes_guest_memory, "global opcode {opcode:#x}");
     }
 }
 

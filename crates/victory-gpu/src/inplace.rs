@@ -274,45 +274,13 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
-    /// Outstanding fenced writes to CPU texture memory. Several lists can
-    /// refer to the same destination before any of their fences signal.
-    readbacks: Vec<(std::ops::Range<usize>, std::sync::Weak<std::sync::atomic::AtomicBool>)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new(), readbacks: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Identifies the mapping present when a readback was recorded. The title
-/// can reuse an address for new physical pages before a GPU fence signals.
-pub(crate) struct ReadbackMapping(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl ReadbackMapping {
-    pub(crate) fn record(at: usize, bytes: usize) -> Option<Self> {
-        let range = at..at.checked_add(bytes)?;
-        if at == 0 || range.is_empty() {
-            return None;
-        }
-        let mut v = views();
-        v.readbacks.retain(|(_, ticket)| ticket.strong_count() > 0);
-        for (existing, ticket) in &v.readbacks {
-            if existing == &range && let Some(live) = ticket.upgrade() {
-                return Some(Self(live));
-            }
-        }
-        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        v.readbacks.push((range, std::sync::Arc::downgrade(&live)));
-        Some(Self(live))
-    }
-
-    /// A remap cannot come between the identity check and the CPU write.
-    pub(crate) fn for_write(&self) -> Option<crate::watch::Reading> {
-        let guard = crate::watch::title_memory_reading();
-        self.0.load(Ordering::Acquire).then_some(guard)
-    }
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -343,23 +311,11 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
     let mut v = views();
-    let end = at.saturating_add(len);
-    v.readbacks.retain(|(range, ticket)| {
-        if range.start >= end || at >= range.end {
-            return ticket.strong_count() > 0;
-        }
-        if let Some(live) = ticket.upgrade() {
-            live.store(false, Ordering::Release);
-        }
-        false
-    });
     if v.views.is_empty() {
         return;
     }
+    let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
@@ -395,107 +351,6 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
         out.push((base, bytes));
     }
     out
-}
-
-/// Physical backing, clipped to the virtual range being changed. A split
-/// Windows view may still show the same section bytes on either side.
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalSpan {
-    start: usize,
-    end: usize,
-    section: usize,
-    offset: u64,
-}
-
-pub(crate) fn physical_spans(range: &std::ops::Range<usize>) -> Vec<PhysicalSpan> {
-    if range.is_empty() {
-        return Vec::new();
-    }
-    let v = views();
-    let search = v
-        .views
-        .range(..=range.start)
-        .next_back()
-        .map_or(range.start, |(&at, _)| at);
-    v.views
-        .range(search..range.end)
-        .filter_map(|(&base, &(size, section, offset))| {
-            let start = range.start.max(base);
-            let end = range.end.min(base.saturating_add(size));
-            (start < end).then_some(PhysicalSpan {
-                start,
-                end,
-                section,
-                offset: offset + (start - base) as u64,
-            })
-        })
-        .collect()
-}
-
-/// Walk the union of the old and new view boundaries without enumerating
-/// pages. A temporary unmap followed by restoring the same backing is valid.
-pub(crate) fn physical_changes(
-    mut old: &[PhysicalSpan],
-    mut new: &[PhysicalSpan],
-    mut changed: impl FnMut(std::ops::Range<usize>),
-) {
-    let mut at = old
-        .first()
-        .into_iter()
-        .chain(new.first())
-        .map(|s| s.start)
-        .min()
-        .unwrap_or(0);
-    while !old.is_empty() || !new.is_empty() {
-        let interval = |list: &[PhysicalSpan]| match list.first() {
-            Some(s) if s.start <= at => {
-                (s.end, Some((s.section, s.offset + (at - s.start) as u64)))
-            }
-            Some(s) => (s.start, None),
-            None => (usize::MAX, None),
-        };
-        let (old_end, old_bytes) = interval(old);
-        let (new_end, new_bytes) = interval(new);
-        let end = old_end.min(new_end);
-        if old_bytes != new_bytes {
-            changed(at..end);
-        }
-        if old.first().is_some_and(|s| s.end == end) {
-            old = &old[1..];
-        }
-        if new.first().is_some_and(|s| s.end == end) {
-            new = &new[1..];
-        }
-        at = end;
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn physical_replacement_keeps_the_unchanged_neighbors_of_a_split_view() {
-    let span = |start, end, section, offset| PhysicalSpan {
-        start,
-        end,
-        section,
-        offset,
-    };
-    let old = [span(100, 400, 1, 1000)];
-    let split = [
-        span(100, 200, 1, 1000),
-        span(200, 300, 2, 0),
-        span(300, 400, 1, 1200),
-    ];
-    let mut changed = Vec::new();
-    physical_changes(&old, &split, |r| changed.push(r));
-    assert_eq!(changed.len(), 1);
-    assert_eq!(changed[0], 200..300);
-    changed.clear();
-    physical_changes(&split, &split, |r| changed.push(r));
-    assert!(changed.is_empty());
-    let shifted = [span(100, 400, 1, 2000)];
-    physical_changes(&old, &shifted, |r| changed.push(r));
-    assert_eq!(changed.len(), 1);
-    assert_eq!(changed[0], 100..400);
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -1281,20 +1136,6 @@ mod tests {
     }
 
     /// What the runtime forgets when memory is mapped anew.
-    #[test]
-    fn texture_readbacks_skip_reused_pages_and_allow_independent_fences() {
-        let base = 0x7_8340_0000;
-        let a = ReadbackMapping::record(base, 2 * K64).unwrap();
-        let b = ReadbackMapping::record(base, 2 * K64).unwrap();
-        let adjacent = ReadbackMapping::record(base + 2 * K64, K64).unwrap();
-        assert!(a.for_write().is_some());
-        views_gone(base + K64, K64);
-        let new = ReadbackMapping::record(base, 2 * K64).unwrap();
-        assert!(a.for_write().is_none() && b.for_write().is_none());
-        assert!(new.for_write().is_some());
-        assert!(adjacent.for_write().is_some());
-    }
-
     #[test]
     fn remapped_memory_forgets_its_views() {
         let at = 0x7_4000_0000usize;

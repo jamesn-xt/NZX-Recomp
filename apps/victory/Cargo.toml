@@ -1,25 +1,15 @@
 [package]
 name = "victory"
-default-run = "nzx-recomp"
-autobins = false
-
-[[bin]]
-name = "nzx-recomp"
-path = "src/main.rs"
-
-[[bin]]
-name = "nzx-play"
-path = "src/bin/victory-play.rs"
-
-[[bin]]
-name = "nzx-warm"
-path = "src/bin/victory-warm.rs"
 description = "Command-line front end: inspect, census, convert, run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "nzx-recomp"
+path = "src/main.rs"
 
 [dependencies]
 victory-core.workspace = true
@@ -33,7 +23,6 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
-tracing.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

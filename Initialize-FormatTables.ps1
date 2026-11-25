@@ -1,9 +1,12 @@
 [CmdletBinding()]
-param([string] $FromCheckout)
+param(
+    [string] $FromCheckout,
+    [string] $Destination = (Join-Path $PSScriptRoot 'crates/victory-formats/src/bcpack-tables.bin')
+)
 
 $ErrorActionPreference = 'Stop'
 $relativePath = 'crates/victory-formats/src/bcpack-tables.bin'
-$destination = Join-Path $PSScriptRoot $relativePath
+$destination = [IO.Path]::GetFullPath($Destination)
 $expectedHash = '1F1D4760419202BB5672F0C428CE51E456B5D08FBAEC8F371D043FD94E01C36B'
 $sourceUrl = "https://raw.githubusercontent.com/Marvisak/VIctory/2849477415a46f5a079c85cf3e64a3dff32f713c/$relativePath"
 
@@ -24,7 +27,9 @@ if (Test-Path -LiteralPath $destination) {
     return
 }
 
-$tempFile = Join-Path (Split-Path -Parent $destination) ([IO.Path]::GetRandomFileName())
+$parent = Split-Path -Parent $destination
+New-Item -ItemType Directory -Path $parent -Force | Out-Null
+$tempFile = Join-Path $parent ([IO.Path]::GetRandomFileName())
 try {
     if ($PSBoundParameters.ContainsKey('FromCheckout')) {
         $source = Join-Path $FromCheckout $relativePath

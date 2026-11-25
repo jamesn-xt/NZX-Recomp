@@ -1,15 +1,11 @@
 //! `SGD5`: the engine's shader file. Each record holds one shader container,
-//! deflate-packed. Scan records by marker for shader warm-up and use the
-//! database tables for effect and pipeline-state inspection.
+//! deflate-packed. The header tables are not decoded yet, so records are
+//! found by their marker and cross-checked by their sizes:
 //!
 //! ```text
 //! u8 name length (with NUL), name, NUL, u8 kind,
 //! u32 n, u32 0x000DDCE7, u32 n, u32 unpacked size, raw deflate (n - 12 bytes)
 //! ```
-
-mod database;
-
-pub use database::{Database, Effect, Pass, STAGES, Shader, Technique, databases};
 
 pub const MAGIC: &[u8; 4] = b"SGD5";
 const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();

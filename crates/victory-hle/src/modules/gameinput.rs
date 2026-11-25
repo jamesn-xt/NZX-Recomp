@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3) or a wired DualSense. The keyboard drives a stand-in
-//! gamepad (`FALLBACK_BUTTONS`) when neither is present. It is a device of its own
+//! (host slots 0-3); while none is connected, the keyboard drives one
+//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -20,13 +20,6 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
-
-#[cfg(windows)]
-mod dualsense;
-#[cfg(feature = "diagnostics")]
-mod movement;
-#[cfg(feature = "diagnostics")]
-use movement::{HeldMovement, MovementFile};
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -58,15 +51,14 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
-/// Devices: XInput slots, the keyboard's stand-in pad, the keyboard, and DualSense.
+/// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
-const DUALSENSE: usize = PADS + 2;
-const DEVICES: usize = PADS + 3;
+const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -117,20 +109,8 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// A native pad when none of the XInput slots is occupied.
-    fn native_pad(&mut self) -> Option<PadState> {
-        None
-    }
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    #[cfg(feature = "diagnostics")]
-    fn auto_enter(&mut self) -> bool {
-        false
-    }
-    #[cfg(feature = "diagnostics")]
-    fn movement(&mut self, _stand_in_connected: bool) -> Option<std::sync::Arc<HeldMovement>> {
-        None
-    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -242,8 +222,6 @@ impl Device {
 #[derive(PartialEq)]
 enum Value {
     Pad(PadState),
-    #[cfg(feature = "diagnostics")]
-    Movement(PadState, std::sync::Arc<HeldMovement>),
     Keys(Vec<KeyState>),
 }
 
@@ -260,8 +238,8 @@ pub struct Reading {
 impl Reading {
     fn kind(&self) -> u32 {
         match self.value {
+            Value::Pad(_) => GAMEPAD_KIND,
             Value::Keys(_) => KEYBOARD_KIND,
-            _ => GAMEPAD_KIND,
         }
     }
 }
@@ -423,50 +401,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, native, keys, stand_in) = {
+        let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            // Prefer XInput, including a virtual pad already supplied by Steam Input.
-            let native = if pads.iter().all(Option::is_none) {
-                source.native_pad()
-            } else {
-                None
-            };
-            let keys = source.keys();
-            #[cfg(feature = "diagnostics")]
-            let (pads, native, keys) = {
-                let (mut pads, mut native, mut keys) = (pads, native, keys);
-                if source.auto_enter() {
-                    if let Some(pad) = pads.iter_mut().flatten().next().or(native.as_mut()) {
-                        pad.buttons |= A;
-                    } else if !keys.iter().any(|k| k.virtual_key == 0x0D) {
-                        keys.push(KeyState {
-                            virtual_key: 0x0D,
-                            scan_code: 0x1C,
-                            ..Default::default()
-                        });
-                    }
-                }
-                (pads, native, keys)
-            };
-            let available = native.is_none() && pads.iter().all(Option::is_none);
-            #[cfg(feature = "diagnostics")]
-            let cue = source.movement(available);
-            let stand_in = available.then(|| {
-                let pad = fallback(&keys);
-                #[cfg(feature = "diagnostics")]
-                if let Some(cue) = cue
-                    && let Some(moved) = cue.apply(pad)
-                {
-                    return Value::Movement(moved, cue);
-                }
-                Value::Pad(pad)
-            });
-            (pads, native, keys, stand_in)
+            (pads, source.keys())
         };
-        let events = self
-            .state()
-            .poll(&self.devices, pads, native, keys, stand_in);
+        let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
 
@@ -510,18 +450,17 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
-        native: Option<PadState>,
         keys: Vec<KeyState>,
-        stand_in: Option<Value>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        self.update(devices, FALLBACK, stand_in, now, &mut events);
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
-        self.update(devices, DUALSENSE, native.map(Value::Pad), now, &mut events);
         events
     }
 
@@ -1058,7 +997,7 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
 extern "system" fn key_count(this: *const Reading) -> u32 {
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
-        _ => 0,
+        Value::Pad(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
@@ -1074,21 +1013,14 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    if out.is_null() {
-        return false;
-    }
-    let state = match &reading(this).value {
-        Value::Keys(_) => return false,
-        Value::Pad(state) => state,
-        #[cfg(feature = "diagnostics")]
-        Value::Movement(state, cue) => {
-            cue.confirm_read(state);
-            state
+    match &reading(this).value {
+        Value::Pad(state) if !out.is_null() => {
+            // SAFETY: checked non-null.
+            unsafe { out.write(*state) };
+            true
         }
-    };
-    // SAFETY: checked non-null.
-    unsafe { out.write(*state) };
-    true
+        _ => false,
+    }
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1198,13 +1130,6 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        dualsense: dualsense::DualSense,
-        #[cfg(feature = "diagnostics")]
-        enter_check: Option<Instant>,
-        #[cfg(feature = "diagnostics")]
-        enter_started: Option<Instant>,
-        #[cfg(feature = "diagnostics")]
-        movement: MovementFile,
     }
 
     impl Source for Host {
@@ -1261,42 +1186,6 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
-        }
-
-        fn native_pad(&mut self) -> Option<PadState> {
-            self.dualsense.poll()
-        }
-
-        #[cfg(feature = "diagnostics")]
-        fn auto_enter(&mut self) -> bool {
-            static SIGNAL: LazyLock<Option<std::path::PathBuf>> =
-                LazyLock::new(|| std::env::var_os("VICTORY_ENTER_ON_FILE").map(Into::into));
-            let Some(path) = SIGNAL.as_ref() else {
-                return false;
-            };
-            const HELD: Duration = Duration::from_millis(200);
-            if let Some(started) = self.enter_started {
-                return started.elapsed() < HELD;
-            }
-            let now = Instant::now();
-            if self.enter_check.is_some_and(|next| now < next) {
-                return false;
-            }
-            self.enter_check = Some(now + Duration::from_millis(100));
-            if !path.is_file() {
-                return false;
-            }
-            self.enter_started = Some(now);
-            tracing::info!(path = %path.display(), "pressing Enter/A for automated startup");
-            true
-        }
-
-        #[cfg(feature = "diagnostics")]
-        fn movement(&mut self, stand_in_connected: bool) -> Option<std::sync::Arc<HeldMovement>> {
-            static PATH: LazyLock<Option<std::path::PathBuf>> =
-                LazyLock::new(|| std::env::var_os("VICTORY_MOVEMENT_FILE").map(Into::into));
-            self.movement
-                .poll(PATH.as_deref()?, Instant::now(), stand_in_connected)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1394,7 +1283,6 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
-        native: Option<PadState>,
         keys: Vec<KeyState>,
         rumble: Vec<(usize, u16, u16)>,
     }
@@ -1404,9 +1292,6 @@ mod tests {
     impl Source for Fake {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
-        }
-        fn native_pad(&mut self) -> Option<PadState> {
-            self.0.lock().unwrap().native
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
@@ -1600,39 +1485,6 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
-    }
-
-    #[test]
-    fn native_pad_sits_between_xinput_and_keyboard_fallback() {
-        let (hub, host) = fake();
-        host.lock().unwrap().native = Some(PadState {
-            buttons: A,
-            ..PadState::default()
-        });
-        hub.poll();
-        assert_eq!(
-            current(hub, GAMEPAD_KIND, FALLBACK),
-            Err(DEVICE_DISCONNECTED)
-        );
-        let reading = current(hub, GAMEPAD_KIND, DUALSENSE).unwrap();
-        assert_eq!(pad(reading).buttons, A);
-        release(reading);
-
-        host.lock().unwrap().pads[0] = Some(PadState::default());
-        hub.poll();
-        assert_eq!(
-            current(hub, GAMEPAD_KIND, DUALSENSE),
-            Err(DEVICE_DISCONNECTED)
-        );
-        release(current(hub, GAMEPAD_KIND, 0).unwrap());
-
-        {
-            let mut host = host.lock().unwrap();
-            host.pads[0] = None;
-            host.native = None;
-        }
-        hub.poll();
-        release(current(hub, GAMEPAD_KIND, FALLBACK).unwrap());
     }
 
     #[test]

@@ -118,30 +118,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
-/// Puts the translation of a container of the title's into the cache on
-/// disk, and with `compute` its host pipeline into the driver's, before any
-/// run wants them. Whether it translated, and whether it has a pipeline
-/// (`None`: not asked for, or left out).
-#[cfg(windows)]
-pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
-    let full = blake3::hash(container);
-    // Not through the table, which lets nothing go.
-    let shader = Arc::new(Shader {
-        stage,
-        hash: full.to_hex()[..16].to_owned(),
-        container: container.to_vec(),
-        translated: OnceLock::new(),
-    });
-    let translated = shader.translated().is_some();
-    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
-    (translated, made)
-}
-
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
-    pub(crate) compute_threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
@@ -204,10 +184,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let compute_threads = programs.iter().find_map(|p| match &p.io {
-        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
-        _ => None,
-    });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -218,7 +194,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, compute_threads, used, stores })
+    Ok(Translated { host, used, stores })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -296,9 +272,6 @@ pub(crate) fn is_builder(this: This) -> bool {
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
-    if !builder_allowed() {
-        return;
-    }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
@@ -310,7 +283,8 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    if !builder_allowed() {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -336,21 +310,6 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
-}
-
-#[cfg(windows)]
-fn builder_allowed() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
-}
-
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn builder_recorded(this: This, indirect: bool) {
-    let p = pipeline(this);
-    if !p.builder_recorded.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(hash = %p.shaders[0].hash, indirect,
-            "recorded first ray-tracing structure builder dispatch for this pipeline");
-    }
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -397,8 +356,6 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    #[cfg(all(windows, feature = "diagnostics"))]
-    builder_recorded: std::sync::atomic::AtomicBool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -408,17 +365,6 @@ const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geomet
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
-}
-
-/// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn shaders_of(this: This) -> String {
-    if this.is_null() {
-        return "no pipeline".to_owned();
-    }
-    let names: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-    format!("[{}]", names.join(", "))
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
@@ -461,7 +407,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_shader_hashes(value: &str, setting: &str) -> Vec<String> {
+fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -472,7 +418,7 @@ fn parse_shader_hashes(value: &str, setting: &str) -> Vec<String> {
             } else {
                 tracing::warn!(
                     hash,
-                    setting, "expected a 16-digit shader hash"
+                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
                 );
                 None
             }
@@ -485,7 +431,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_shader_hashes(&value, "VICTORY_SKIP_PIPELINES")
+        parse_skip_hashes(&value)
     });
     if hashes.is_empty() {
         return None;
@@ -494,28 +440,6 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
-}
-
-/// Recording-time trace, independent of the present and heavy-frame capture.
-/// The budget is per shader so that a frequent stage cannot silence a later stage.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn trace_builder_args(this: This, log: impl FnOnce(&str, usize)) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static SELECTED: OnceLock<HashMap<String, AtomicUsize>> = OnceLock::new();
-    let selected = SELECTED.get_or_init(|| {
-        let value = std::env::var("VICTORY_BVH_TRACE").unwrap_or_default();
-        parse_shader_hashes(&value, "VICTORY_BVH_TRACE").into_iter()
-            .map(|hash| (hash, AtomicUsize::new(0))).collect()
-    });
-    if selected.is_empty() {
-        return;
-    }
-    let hash = &pipeline(this).shaders[0].hash;
-    if let Some(n) = selected.get(hash)
-        && let Ok(previous) = n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 256).then_some(n + 1))
-    {
-        log(hash, previous + 1);
-    }
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -597,8 +521,6 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
-        #[cfg(all(windows, feature = "diagnostics"))]
-        builder_recorded: std::sync::atomic::AtomicBool::new(false),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -740,8 +662,6 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
-    #[cfg(windows)]
-    graphics.apply_integer_blend_bypass();
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -807,9 +727,9 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_shader_hashes(" , ", "test").is_empty());
+        assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
-            super::parse_shader_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,", "test"),
+            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }

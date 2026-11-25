@@ -2,10 +2,12 @@
 //! each thread's unwound stack as `module+rva` that many seconds after
 //! [`dump_stacks_on_schedule`], to find what a title waits on.
 
+use std::ffi::c_void;
+
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
 };
@@ -13,7 +15,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
+    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
@@ -101,7 +103,7 @@ pub fn dump_stacks() {
         let (frames, (priority, base)) = frames_of(thread);
         eprintln!(
             "  thread {id} \"{}\" start {} priority {priority} (base {base})",
-            crate::threads::thread_name(thread),
+            name_of(thread),
             locate(start_of(thread))
         );
         for (i, pc) in frames.into_iter().enumerate() {
@@ -170,6 +172,20 @@ fn start_of(thread: HANDLE) -> usize {
         )
     };
     start
+}
+
+fn name_of(thread: HANDLE) -> String {
+    let mut name = std::ptr::null_mut();
+    // SAFETY: the system allocates the string; we free it with LocalFree.
+    unsafe {
+        if GetThreadDescription(thread, &mut name) < 0 || name.is_null() {
+            return String::new();
+        }
+        let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+        LocalFree(name.cast::<c_void>());
+        text
+    }
 }
 
 #[cfg(test)]

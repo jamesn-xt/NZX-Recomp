@@ -45,7 +45,7 @@
 
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
-# A local copy of the separately supplied BCPack tables stays ignored.
+# The one exception (docs/asset-policy.md): the BCPack format's constant tables.
 *.dat
 *.pak
 *.rpf
@@ -75,6 +75,3 @@
 *.swp
 Thumbs.db
 .DS_Store
-
-# Legacy donor installer is not distributed; use Build.ps1.
-/Setup-DexNomRuntime.ps1

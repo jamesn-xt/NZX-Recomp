@@ -39,8 +39,7 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   dword 0 of kind [`USER_MEMORY_BASE`]. Dword 1 is the last copy
-///   number prepared for the recorded bind; later numbers and slot `base` itself
+///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
@@ -48,9 +47,6 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
-/// Root SRV of guest buffer and acceleration-structure addresses by view-heap
-/// slot. The header gives the number of slots, entry zero is the null value.
-pub const SLOT_VIEW_ADDRESSES: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -73,19 +69,6 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
-/// `RootType::Other` code of a user-data dword the host sets: the number of
-/// the first thread group in x. The console dispatches any number of groups
-/// in one dimension; the host at most 65,535, so a larger dispatch runs in
-/// parts, each with the groups before it here. Asked for by compute programs
-/// that are told the x number alone (the one-dimensional ones).
-pub const USER_GROUP_BASE: u32 = 0x104;
-/// The GFX10 record count of the structured SRV at descriptor-table `slot`
-/// and `dword`, as supplied by the title before adjusting the host view.
-pub const USER_VIEW_RECORDS: u32 = 0x105;
-/// Actual X thread count of a one-dimensional partial dispatch. Zero
-/// keeps all threads of every dispatched group active. The metadata's
-/// `dword` holds the group's X width, `index` the host binding.
-pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -171,10 +154,6 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
-    /// Root UAV slots whose emitted operations may modify buffer contents.
-    pub written_root_uavs: Vec<u8>,
-    /// A translated store or atomic can write through the guest page directory.
-    pub writes_guest_memory: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -187,52 +166,6 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
-}
-
-#[cfg(test)]
-#[test]
-fn only_the_written_root_uavs_need_a_guest_writeback() {
-    let mut s = Shader::new(false);
-    let input = s.root_uav_handle(1);
-    let output = s.root_uav_handle(2);
-    let counter = s.root_uav_handle(3);
-    let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
-    let undef = s.m.undef(s.t.i32);
-    for handle in [input, output] {
-        s.op(
-            s.entry,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            s.t.res_ret,
-            139,
-            &[handle, zero, undef, mask, align],
-        );
-    }
-    s.op(
-        s.entry,
-        "rawBufferStore.i32",
-        Attr::NoUnwind,
-        s.t.void,
-        140,
-        &[output, zero, undef, one, undef, undef, undef, mask, align],
-    );
-    s.op(
-        s.entry,
-        "atomicBinOp.i32",
-        Attr::NoUnwind,
-        s.t.i32,
-        78,
-        &[counter, zero, zero, undef, undef, one],
-    );
-    s.op(
-        s.entry,
-        "atomicCompareExchange.i32",
-        Attr::NoUnwind,
-        s.t.i32,
-        79,
-        &[counter, zero, undef, undef, zero, one],
-    );
-    assert_eq!(s.written_root_uavs, [2, 3]);
 }
 
 impl Shader {
@@ -278,8 +211,6 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            written_root_uavs: Vec::new(),
-            writes_guest_memory: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -313,16 +244,6 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        // Raw root UAVs are also legal inputs. Only a read through a handle
-        // is known to leave it unchanged. Treat any other use of the handle
-        // conservatively, including atomics and future operations.
-        if !matches!(opcode, 68 | 72 | 139) // BufferLoad, GetDimensions, RawBufferLoad
-            && let Some(first) = args.first()
-            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
-            && !self.written_root_uavs.contains(&slot)
-        {
-            self.written_root_uavs.push(slot);
-        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -524,29 +445,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
-        if self.pixel {
-            // Reading a per-vertex value with attributeAtVertex needs a
-            // constant input, even when the source declaration was smooth.
-            // D3D requires all components packed into the same register to
-            // share a mode, including the ones the shader never reads.
-            for index in 0..self.inputs.len() {
-                let unused = &self.inputs[index];
-                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
-                    continue;
-                }
-                let mut modes = self.inputs.iter()
-                    .filter(|e| e.row == unused.row && e.usage != 0)
-                    .map(|e| e.interp);
-                if let Some(mode) = modes.next()
-                    && (mode == 1 || unused.comp == 9)
-                    && modes.all(|other| other == mode)
-                {
-                    self.inputs[index].interp = mode;
-                }
-            }
-        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // One interpolation mode per signature row, before the metadata
+        // and the container parts declare them.
+        container::unify_row_modes(&mut self.inputs, true);
+        container::unify_row_modes(&mut self.outputs, false);
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).

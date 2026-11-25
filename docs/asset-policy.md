@@ -26,9 +26,13 @@ In any form (files, string literals, fixtures, snapshots, docs):
 ## Local build dependency
 
 The BCPack decoder needs constant format tables supplied separately from the
-GPL-licensed source. Run `Initialize-FormatTables.ps1` before building to
-prepare a hash-verified local copy at
-`crates/victory-formats/src/bcpack-tables.bin`. Git ignores this file.
+GPL-licensed source. Run `Initialize-FormatTables.ps1` before running the
+decoder tests. The default destination is
+`crates/victory-formats/src/bcpack-tables.bin`, which Git ignores.
+For gameplay the runtime loads the table beside its executable.
+`Build.ps1` prepares this file locally. When extracting a release, run
+`Initialize-FormatTables.ps1 -Destination .\bcpack-tables.bin` from the
+extracted directory before playing.
 The same source-only check applies to this path as to every other path.
 The original upstream repository tracks the tables in its history.
 
@@ -44,7 +48,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs.
+   signatures, and hold no long hex/base64 runs. Exceptions need an entry
+   with a reason in `xtask/src/policy.rs`.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables
