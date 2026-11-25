@@ -86,7 +86,7 @@ Branch `test/rtx4080-heap-timing` splits the existing slot-pass time into planni
 existing slot time, not additional frame costs. In the texture-prelude run the
 whole slot stage sometimes took around 88 ms/frame; this split will show which
 part deserves optimization. It changes timing/logging only. Workspace Clippy
-and release compilation pass; a runtime measurement of the split is pending.
+and release compilation pass. Runtime measurements of this split are reported below.
 
 ## Following CPU and descriptor corrections
 
@@ -111,8 +111,8 @@ GPU suite passes **185 tests, 0 failed, 3 ignored**; workspace Clippy and the
 diagnostics release build pass. This is additional GPU validation, not a claim
 that the full workspace suite was rerun on this child revision. The executable
 SHA-256 is `A6A3DE82020241AD3D39C221C5CA60B047C90D0D9FC0096B972AF2404D71BCF0`.
-Its bounded title run is in progress. These tests do not establish that a
-particular title draw reaches the sampler race or that all flicker is fixed.
+These shader tests do not establish that a particular title draw reaches the
+sampler race or that all flicker is fixed.
 
 That bounded title run has now completed (720-second guard, intentional exit).
 With in-flight fetch enabled, seconds 420–500 contained 16 caption samples:
