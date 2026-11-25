@@ -3056,6 +3056,9 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
     #[test]
     fn copied_sampler_uses_the_record_that_was_fingerprinted() {
         let heap = HostHeap::new(true, 8).expect("D3D12 test sampler heap");
@@ -3095,6 +3098,232 @@ mod tests {
         assert_eq!(installed(), key(b));
         assert!(!heap.made(2), "unrelated slot was modified");
     }
+    #[test]
+    fn copied_sampler_controls_fenced_shader_output() {
+        const SOURCE: &str = include_str!("sampler-output.hlsl");
+        let host = host().expect("D3D12 test host");
+        let device = &host.device;
+        let samplers = HostHeap::new(true, 3).expect("D3D12 test sampler heap");
+        let mut clamp_record = [0u32; 4];
+        let mut wrap_record = [0u32; 4];
+        let mut live = [0u32; 4];
+        // D3D12 point samplers with identical fields except AddressU.
+        let clamp = [0, 3, 3, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff];
+        let mut wrap = clamp;
+        wrap[1] = 1;
+        super::super::create_sampler(std::ptr::null(), &clamp, clamp_record.as_mut_ptr() as u64);
+        super::super::create_sampler(std::ptr::null(), &wrap, wrap_record.as_mut_ptr() as u64);
+        let bytes = |record: [u32; 4]| {
+            let mut out = [0u8; 16];
+            for (dst, word) in out.chunks_exact_mut(4).zip(record) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+            out
+        };
+        // Slot 0 is the copied-record path under test. Its captured bytes
+        // name clamp while the still-valid live record has already become wrap.
+        live.copy_from_slice(&wrap_record);
+        assert!(samplers.mirror_copied(0, live.as_mut_ptr() as u64, &bytes(clamp_record)));
+        assert!(samplers.mirror(1, clamp_record.as_ptr() as u64, false).is_some());
+        assert!(samplers.mirror(2, wrap_record.as_ptr() as u64, false).is_some());
+
+        let texture = |state| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 2,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut resource = None;
+            unsafe {
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
+                    .unwrap();
+            }
+            resource.unwrap()
+        };
+        let buffer = |size: u64, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut resource = None;
+            unsafe {
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
+                    .unwrap();
+            }
+            resource.unwrap()
+        };
+        let target = texture(D3D12_RESOURCE_STATE_COPY_DEST);
+        let decoy = texture(D3D12_RESOURCE_STATE_COPY_DEST);
+        let upload = buffer(
+            1024,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let output = buffer(
+            256,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let readback = buffer(
+            256,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        let mut mapped = std::ptr::null_mut();
+        unsafe {
+            upload.Map(0, Some(&empty), Some(&mut mapped)).unwrap();
+            mapped.cast::<u8>().write(17);
+            mapped.cast::<u8>().add(1).write(231);
+            mapped.cast::<u8>().add(512).write(61);
+            mapped.cast::<u8>().add(513).write(199);
+            upload.Unmap(0, None);
+        }
+
+        let view_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 2,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            ..Default::default()
+        };
+        let views: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&view_desc).unwrap() };
+        let start = unsafe { views.GetCPUDescriptorHandleForHeapStart() };
+        let step = unsafe { device.GetDescriptorHandleIncrementSize(view_desc.Type) } as usize;
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            device.CreateShaderResourceView(&target, Some(&srv), start);
+            device.CreateShaderResourceView(&decoy, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + step });
+        }
+
+        let code = crate::host::compile(
+            SOURCE,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .expect("sampler output shader");
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &code).unwrap() };
+        let pso: ID3D12PipelineState = unsafe {
+            device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() };
+        let list: ID3D12GraphicsCommandList =
+            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap() };
+        let subresource = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let placed = |offset| D3D12_TEXTURE_COPY_LOCATION {
+            pResource: unsafe { std::mem::transmute_copy(&upload) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8_UNORM,
+                        Width: 2,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        unsafe {
+            list.CopyTextureRegion(&subresource(&target), 0, 0, 0, &placed(0), None);
+            list.CopyTextureRegion(&subresource(&decoy), 0, 0, 0, &placed(512), None);
+            list.ResourceBarrier(&[
+                crate::host::transition(
+                    &target,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+                crate::host::transition(
+                    &decoy,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+            ]);
+            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+            list.SetComputeRootDescriptorTable(1, samplers.gpu_handle(0));
+            list.SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[crate::host::transition(
+                &output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &output, 0, 12);
+            list.Close().unwrap();
+            let command: ID3D12CommandList = list.cast().unwrap();
+            host.queue().ExecuteCommandLists(&[Some(command)]);
+        }
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        let event = unsafe { CreateEventW(None, false, false, None).unwrap() };
+        unsafe {
+            host.queue().Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            windows::Win32::Foundation::CloseHandle(event).unwrap();
+            device.GetDeviceRemovedReason().unwrap();
+            assert_eq!(fence.GetCompletedValue(), 1);
+            readback
+                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 12 }), Some(&mut mapped))
+                .unwrap();
+            let actual = std::slice::from_raw_parts(mapped.cast::<u32>(), 3);
+            eprintln!("SAMPLER-OUTPUT changed/clamp/decoy={actual:?}");
+            assert_eq!(actual, [231, 231, 61]);
+            readback.Unmap(0, Some(&empty));
+        }
+    }
+
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
