@@ -3123,7 +3123,13 @@ mod tests {
         // Slot 0 is the copied-record path under test. Its captured bytes
         // name clamp while the still-valid live record has already become wrap.
         live.copy_from_slice(&wrap_record);
-        assert!(samplers.mirror_copied(0, live.as_mut_ptr() as u64, &bytes(clamp_record)));
+        let captured = bytes(clamp_record);
+        let mut changed = Vec::new();
+        assert_eq!(samplers.mirror_copied(
+            std::iter::once((0, &captured[..])),
+            |_| live.as_ptr() as u64,
+            &mut changed,
+        ), 1);
         assert!(samplers.mirror(1, clamp_record.as_ptr() as u64, false).is_some());
         assert!(samplers.mirror(2, wrap_record.as_ptr() as u64, false).is_some());
 
