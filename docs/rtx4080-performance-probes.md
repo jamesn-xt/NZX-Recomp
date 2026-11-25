@@ -96,7 +96,9 @@ window instead of saving the primary plane's black menu image.
 
 The earlier Series X run left roughly 1.2 GiB physical memory available and showed
 heavy paging during streaming; the observed Series S run leaves several GiB more.
-GPU execution and CPU buffer preparation still cost far more than a 33.3 ms frame.
+CPU buffer preparation and copy-back remain much larger than a 33.3 ms frame
+budget. These timers overlap; they must not be summed, and a fence-wait duration
+is not a measurement of the GPU's command execution time.
 
 ## Checks
 
