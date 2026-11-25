@@ -6501,12 +6501,6 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
-            #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // The present's second plane, if it has one, goes over the copy
@@ -6561,6 +6555,26 @@ impl Host {
                 ]);
             }
             let _ = drawn;
+            // Diagnostics must read the composed back buffer. The primary
+            // plane can be black while the overlay contains all visible UI.
+            #[cfg(feature = "diagnostics")]
+            let (capture, probe) = {
+                let save = crate::capture::wanted(frame);
+                let check = slot.is_none();
+                if save || check {
+                    list.ResourceBarrier(&[transition(
+                        &back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let capture = save.then(|| crate::capture::read_back(&self.device, list, &back)).flatten();
+                    let probe = check.then(|| crate::capture::probe(&self.device, list, &back)).flatten();
+                    list.ResourceBarrier(&[transition(
+                        &back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                    (capture, probe)
+                } else {
+                    (None, None)
+                }
+            };
             copy.close();
             match slot {
                 Some(i) => {

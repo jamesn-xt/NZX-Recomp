@@ -81,6 +81,8 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     let readback = host.read_back_buffer(768).unwrap();
     let commands = host.new_list().unwrap();
     let list = &commands.list;
+    #[cfg(feature = "diagnostics")]
+    let (capture, probe);
     // SAFETY: both views and all resources live through command completion.
     unsafe {
         let scene_view = host.rtv(Some(&scene), None);
@@ -116,6 +118,14 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
         ));
         list.ResourceBarrier(&[transition(&target, rtv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyTextureRegion(&rows(&readback), 0, 0, 0, &sub(&target), None);
+        #[cfg(feature = "diagnostics")]
+        {
+            // The present path reads the final back buffer, after the UI
+            // overlay, rather than the scene plane. Both diagnostic paths
+            // must see the green/red columns as well as the blue scene.
+            capture = crate::capture::read_back(&host.device, list, &target).unwrap();
+            probe = crate::capture::probe(&host.device, list, &target).unwrap();
+        }
     }
     commands.close();
     host.execute(&[&commands]);
@@ -141,5 +151,25 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     ];
     for row in pixels {
         assert_eq!(&row[..], expected.as_flattened());
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let (image, footprint) = capture;
+        let pitch = footprint.Footprint.RowPitch as usize;
+        assert_eq!((footprint.Footprint.Width, footprint.Footprint.Height), (5, 3));
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: execute completed all copies; each captured row has five
+        // RGBA8 texels inside its padded footprint.
+        unsafe {
+            image.Map(0, None, Some(&mut ptr)).unwrap();
+            for y in 0..3 {
+                assert_eq!(
+                    std::slice::from_raw_parts(ptr.cast::<u8>().add(y * pitch), 20),
+                    expected.as_flattened(),
+                );
+            }
+            image.Unmap(0, None);
+        }
+        assert!(!crate::capture::black(&probe), "the composed frame is visible");
     }
 }
