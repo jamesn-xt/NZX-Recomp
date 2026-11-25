@@ -1819,7 +1819,7 @@ impl HostHeap {
         &self,
         records: impl Iterator<Item = (u32, &'a [u8])>,
         handle_of: impl Fn(u32) -> u64,
-        changed: &mut Vec<u32>,
+        changed: &mut Vec<(u32, [u32; 3])>,
     ) -> u64 {
         changed.clear();
         {
@@ -1836,15 +1836,18 @@ impl HostHeap {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
+                let Some(header) = record.first_chunk::<12>() else { continue };
                 if let Some(last) = copied.get_mut(index as usize)
                     && record_changed(last, record)
                 {
-                    changed.push(index);
+                    let word = |at| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
+                    changed.push((index, [word(0), word(4), word(8)]));
                 }
             }
         }
-        for &index in changed.iter() {
-            self.mirror(index, handle_of(index), false);
+        for &(index, header) in changed.iter() {
+            // Publish exactly the immutable record whose fingerprint we kept.
+            self.mirror_record(index, handle_of(index), false, header);
         }
         changed.len() as u64
     }
@@ -1869,7 +1872,17 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, for_draw, record)
+    }
+
+    fn mirror_record(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        [tag, i, generation]: [u32; 3],
+    ) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -3043,6 +3056,46 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn copied_sampler_uses_the_record_that_was_fingerprinted() {
+        let heap = HostHeap::new(true, 8).expect("D3D12 test sampler heap");
+        let mut a = [0u32; 4];
+        let mut b = [0u32; 4];
+        let mut live = [0u32; 4];
+        let clamp = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut wrap = clamp;
+        wrap[1] = 1;
+        super::super::create_sampler(std::ptr::null(), &clamp, a.as_mut_ptr() as u64);
+        super::super::create_sampler(std::ptr::null(), &wrap, b.as_mut_ptr() as u64);
+        let key = |r: [u32; 4]| u64::from(r[2]) << 32 | u64::from(r[1]);
+        let bytes = |r: [u32; 4]| {
+            let mut out = [0u8; 16];
+            for (dst, word) in out.chunks_exact_mut(4).zip(r) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+            out
+        };
+        assert_ne!(key(a), key(b));
+        let handle = live.as_mut_ptr() as u64;
+        let installed = || heap.made.lock().unwrap()[1];
+        let mirror = |index, record: &[u8]| {
+            let mut changed = Vec::new();
+            heap.mirror_copied(std::iter::once((index, record)), |_| handle, &mut changed) != 0
+        };
+        // The sampler record interning is identical to the title's API
+        // writes. Both byte records and the later guest location are valid.
+        live.copy_from_slice(&b);
+        assert!(mirror(1, &bytes(a)));
+        let first = installed();
+        live.copy_from_slice(&a);
+        assert!(!mirror(1, &bytes(a)));
+        assert_eq!((first, installed()), (key(a), key(a)));
+        live.copy_from_slice(&b);
+        assert!(mirror(1, &bytes(b)));
+        assert_eq!(installed(), key(b));
+        assert!(!heap.made(2), "unrelated slot was modified");
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -3615,11 +3668,11 @@ mod copied_tests {
         let handle = |index: u32| records[index as usize].as_ptr() as u64;
         let mut changed = Vec::new();
         assert_eq!(heap.mirror_copied([(1, &bytes[32..64]), (2, &bytes[64..96])].into_iter(), handle, &mut changed), 1);
-        assert_eq!(changed, [2]);
+        assert_eq!(changed, [(2, [1; 3])]);
         assert_eq!(heap.copied.lock().unwrap()[1], 0, "deferred record was consumed");
         heap.tabled_in(1, true, frame.wrapping_sub(super::TABLED_FRAMES + 1));
         assert_eq!(heap.mirror_copied([(1, &bytes[32..64])].into_iter(), handle, &mut changed), 1);
-        assert_eq!(changed, [1]);
+        assert_eq!(changed, [(1, [1; 3])]);
     }
 
     /// A record is mirrored when it is not the one last seen in its slot,
