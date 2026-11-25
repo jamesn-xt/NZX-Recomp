@@ -55,6 +55,9 @@ pub(crate) struct Staging {
     /// Highest late-submission number (`crate::host::STARTED`) that may
     /// still be reading this staging buffer on the GPU (`0` if none).
     in_flight: std::sync::atomic::AtomicU64,
+    /// A mapping change can make a previously missing mip readable before
+    /// the next periodic check of a partially mapped texture.
+    remap_pending: std::sync::atomic::AtomicBool,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -198,6 +201,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
         // overlap the remapped range.
         let (start, bytes) = staging.memory();
         if start.saturating_add(bytes) > at {
+            staging.remap_pending.store(true, Relaxed);
             staging.dirty.store(true, Relaxed);
         }
     }
@@ -1047,10 +1051,14 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        let remapped = self.remap_pending.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if remapped {
+            last.partial = None;
+        }
         let frame = crate::frame::current();
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             last.motion = Motion::default();
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !remapped && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -1082,7 +1090,7 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn && !last.motion.active(frame) {
+            if !remapped && unwritten && !turn && !last.motion.active(frame) {
                 return 0;
             }
         }
@@ -1472,6 +1480,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     mapped_regions(start, end)
 }
 
+/// Count committed bytes exactly for heap texture admission. Sampling one
+/// 4 KiB page per 64 KiB block can miss a mip or mark it complete too soon.
+pub(crate) fn resident_bytes(at: usize, len: usize) -> u64 {
+    mapped_regions(at, at.saturating_add(len))
+}
+
 fn mapped_regions(start: usize, end: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
@@ -1565,6 +1579,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),
+        remap_pending: std::sync::atomic::AtomicBool::new(false),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
@@ -1616,6 +1631,42 @@ mod motion_tests {
 #[cfg(test)]
 mod remap_tests {
     use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn a_newly_mapped_texture_page_bypasses_the_partial_upload_cooldown() {
+        use windows_sys::Win32::System::Memory::*;
+        if crate::host::host().is_none() {
+            return;
+        }
+        const PAGE: usize = 64 << 10;
+        // SAFETY: this reservation belongs to the test. Only the first two
+        // pages will be committed; the texture remains partially mapped.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: commit the first page of the test reservation.
+        assert_eq!(unsafe { VirtualAlloc(base, PAGE, MEM_COMMIT, PAGE_READWRITE) }, base);
+        let desc = [3, 0, 0, 0, 256, 0, 256, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let resource = crate::resource::texture_at(base as u64, &desc).unwrap();
+        let staging = super::staging(resource, crate::resource::host_resource(resource).unwrap()).unwrap();
+        let size = staging.layout.size as usize;
+        assert!(size > 2 * PAGE && size <= 4 * PAGE);
+        let mut no_flight = |_| panic!("test staging was never submitted");
+        assert_eq!(staging.refresh_timed(&mut no_flight), size);
+
+        // SAFETY: commit and write the second page of the test reservation.
+        let next = unsafe { base.cast::<u8>().add(PAGE) };
+        assert_eq!(unsafe { VirtualAlloc(next.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }, next.cast());
+        unsafe { next.write_bytes(0x68, PAGE) };
+        assert_eq!(staging.refresh_timed(&mut no_flight), 0, "the polling cooldown still applies");
+        crate::watch::title_memory_remapped(next as usize, PAGE);
+        assert_eq!(staging.refresh_timed(&mut no_flight), size, "a mapped mip must be picked up immediately");
+        assert_eq!(staging.refresh_timed(&mut no_flight), 0, "the cooldown resumes after the refresh");
+
+        super::unstage(resource);
+        drop(staging);
+        // SAFETY: no staged read remains and the reservation is released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
 
     /// After a remap of the memory under a texture that was already
     /// uploaded, the texture must be uploaded again (#574). A remap of
