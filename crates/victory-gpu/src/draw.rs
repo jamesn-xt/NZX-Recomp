@@ -366,6 +366,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of those microseconds: looking at slots, the copies' spans and their
 /// refreshes, the texture side ([`State::heap_textures`]).
 pub(crate) static HEAP_PASS_MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Within the slot pass: planning due slots (including bookkeeping locks)
+/// and resolving/mirroring the selected views. Subsets of HEAP_PASS_MICROS[0].
+pub(crate) static HEAP_SLOT_MICROS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Slots looked at by those passes, and host copies brought up to date.
 pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Textures brought up to date for shaders that pick them by index
@@ -1421,6 +1424,7 @@ impl State {
             record,
             crate::descriptor::record_entry,
         );
+        let planned = started.elapsed();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1471,6 +1475,9 @@ impl State {
         }
         let views = ranges.views() as u32;
         let looked = started.elapsed();
+        for (part, elapsed) in HEAP_SLOT_MICROS.iter().zip([planned, looked - planned]) {
+            part.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        }
         // Per host copy, the span its picked views cover.
         let spans = ranges.spans();
         drop(kept);

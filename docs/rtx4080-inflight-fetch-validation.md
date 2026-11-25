@@ -61,3 +61,13 @@ here. A future integration should handle multi-list state chaining or restore
 states at actual list boundaries, then test the combined copy path and its cost.
 
 No title files, derived shaders, captures, saves or raw runtime logs are included.
+
+## Next profiling probe
+
+Branch `test/rtx4080-heap-timing` splits the existing slot-pass time into planning
+(including bookkeeping locks and deciding which slots are due) and mirroring
+(resolving the selected views and their host copies). These are subsets of the
+existing slot time, not additional frame costs. In the texture-prelude run the
+whole slot stage sometimes took around 88 ms/frame; this split will show which
+part deserves optimization. It changes timing/logging only. Workspace Clippy
+and release compilation pass; a runtime measurement of the split is pending.
