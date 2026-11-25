@@ -2,7 +2,7 @@
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("DexNom Runtime requires Windows.");
+    eprintln!("NZX Recomp requires Windows.");
 }
 
 #[cfg(windows)]

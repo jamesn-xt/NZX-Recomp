@@ -59,7 +59,7 @@ fn run() -> windows::core::Result<()> {
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
             CLASS,
-            w!("DexNom Runtime diagnostics"),
+            w!("NZX Recomp diagnostics"),
             WS_POPUP,
             0,
             0,

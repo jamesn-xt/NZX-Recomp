@@ -779,7 +779,7 @@ mod tests {
     fn the_caption_ends_with_how_long_the_process_has_run() {
         use super::{Duration, caption};
 
-        let figures = "DexNom Runtime | 1 fps 953.5 ms/frame | 1526 draws/frame";
+        let figures = "NZX Recomp | 1 fps 953.5 ms/frame | 1526 draws/frame";
         let up = |secs| caption(figures, Duration::from_secs(secs));
         assert_eq!(up(0), format!("{figures} | up 0:00"));
         assert_eq!(up(59), format!("{figures} | up 0:59"));
@@ -6945,10 +6945,10 @@ impl Meter {
         }
         let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
         crate::debug_hud::update(hwnd, || {
-            format!("DexNom Runtime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
+            format!("NZX Recomp diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
         });
         let text = format!(
-            "DexNom Runtime | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+            "NZX Recomp | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
              cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
         );
         // Setting the text waits for the window's thread (a title thread,
@@ -7533,7 +7533,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("DexNom Runtime"),
+            w!("NZX Recomp"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

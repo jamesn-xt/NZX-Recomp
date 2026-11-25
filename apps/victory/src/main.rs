@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
+    name = "nzx-recomp",
     version,
     about = "Run an Xbox Series title natively on Windows"
 )]

@@ -1,6 +1,19 @@
 [package]
 name = "victory"
-default-run = "victory"
+default-run = "nzx-recomp"
+autobins = false
+
+[[bin]]
+name = "nzx-recomp"
+path = "src/main.rs"
+
+[[bin]]
+name = "nzx-play"
+path = "src/bin/victory-play.rs"
+
+[[bin]]
+name = "nzx-warm"
+path = "src/bin/victory-warm.rs"
 description = "Command-line front end: inspect, census, convert, run."
 version.workspace = true
 edition.workspace = true

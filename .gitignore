@@ -75,3 +75,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Legacy donor installer is not distributed; use Build.ps1.
+/Setup-DexNomRuntime.ps1

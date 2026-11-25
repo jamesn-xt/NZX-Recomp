@@ -1,6 +1,6 @@
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("DexNom Runtime shader preloading requires Windows.");
+    eprintln!("NZX Recomp shader preloading requires Windows.");
 }
 
 #[cfg(windows)]

@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let launcher = std::env::current_exe()?;
     let folder = launcher.parent().context("Launcher folder is missing")?;
-    let runtime = folder.join("victory.exe");
+    let runtime = folder.join("nzx-recomp.exe");
     let mut args = std::env::args_os().skip(1).peekable();
     let (mut warp, mut rt) = (false, false);
     while let Some(option) = args.peek() {
@@ -38,7 +38,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     }
     if !game.is_file() || !runtime.is_file() {
         bail!(
-            "Game or VIctory executable is missing.\n\n{}\n{}",
+            "Game or NZX Recomp executable is missing.\n\n{}\n{}",
             game.display(),
             runtime.display()
         );
@@ -58,7 +58,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .truncate(false)
         .share_mode(0)
         .open(state.join("launcher.lock"))
-        .context("Could not lock the launcher state. Check for another DexNom Runtime session.")?;
+        .context("Could not lock the launcher state. Check for another NZX Recomp session.")?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let action = if warm { "warm" } else { "run" };
     let path = logs.join(format!("{action}-{started}-{}.log", std::process::id()));
@@ -117,12 +117,12 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             .stdout(log.try_clone()?)
             .status()
             .with_context(|| format!("Could not start {}", runtime.display()))?;
-        writeln!(log, "VIctory exited with {status}")?;
+        writeln!(log, "NZX Recomp exited with {status}")?;
         status
     };
     if !status.success() {
         bail!(
-            "VIctory exited with {status}.\n\nLog file\n{}",
+            "NZX Recomp exited with {status}.\n\nLog file\n{}",
             path.display()
         );
     }
@@ -153,7 +153,7 @@ fn preload(
         .arg(root)
         .stdout(Stdio::piped())
         .spawn()
-        .context("Could not start DexNom Runtime shader preload")?;
+        .context("Could not start NZX Recomp shader preload")?;
     let stdout = worker
         .stdout
         .take()
@@ -172,7 +172,7 @@ fn preload(
                 })
             });
     let status = worker.wait()?;
-    writeln!(log, "VIctory exited with {status}")?;
+    writeln!(log, "NZX Recomp exited with {status}")?;
     if status.success()
         && let Err(message) = check_warm_summary(last?.as_deref())
     {
@@ -207,7 +207,7 @@ pub(super) fn show_error(text: &str) {
         fn MessageBoxW(owner: *mut c_void, text: *const u16, title: *const u16, flags: u32) -> i32;
     }
     let text: Vec<_> = text.encode_utf16().chain([0]).collect();
-    let title: Vec<_> = "DexNom Runtime".encode_utf16().chain([0]).collect();
+    let title: Vec<_> = "NZX Recomp".encode_utf16().chain([0]).collect();
     // SAFETY: the two strings are NUL terminated and live for the call.
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10) };
 }
