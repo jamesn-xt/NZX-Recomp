@@ -974,10 +974,13 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The separately supplied format tables next to the runtime executable.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    let executable = std::env::current_exe().map_err(|e| format!("runtime path: {e}"))?;
+    let path = executable.with_file_name("bcpack-tables.bin");
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}; run Initialize-FormatTables.ps1 to prepare the file", path.display()))?;
+    Tables::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.

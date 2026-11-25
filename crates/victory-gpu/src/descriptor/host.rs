@@ -466,14 +466,21 @@ impl TextureQueue {
     /// Up to `max` of the slots whose next look is due at `frame`, the ones
     /// due longest first.
     fn rechecks_due(&self, frame: u64, max: usize) -> Vec<(u32, Recheck)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut due: Vec<(u32, Recheck)> = self
             .rechecks
             .iter()
             .filter(|(_, r)| r.due <= frame)
             .map(|(&index, &r)| (index, r))
             .collect();
-        due.sort_unstable_by_key(|&(index, r)| (r.due, index));
-        due.truncate(max);
+        let order = |&(index, r): &(u32, Recheck)| (r.due, index);
+        if due.len() > max {
+            due.select_nth_unstable_by_key(max, order);
+            due.truncate(max);
+        }
+        due.sort_unstable_by_key(order);
         due
     }
 

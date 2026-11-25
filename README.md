@@ -19,7 +19,7 @@ Use the pinned Rust toolchain, Visual Studio C++ build tools and Windows SDK. Bu
 cargo build --locked --release -p victory --features diagnostics --bins
 ```
 
-The Cargo package and internal crate names retain `victory` for compatibility. The programs are `nzx-recomp.exe`, `nzx-play.exe` and `nzx-warm.exe`. Copy all three from `target\release` into a writable directory outside the checkout, or use `Build.ps1` to build and copy them:
+The Cargo package and internal crate names retain `victory` for compatibility. The programs are `nzx-recomp.exe`, `nzx-play.exe` and `nzx-warm.exe`. Use `Build.ps1` to build and install the three programs and prepare their local format-table file:
 
 ```powershell
 .\Build.ps1 -OutputDirectory 'D:\NZX Recomp' -GamePath 'D:\My Game\game.exe'
@@ -27,7 +27,7 @@ The Cargo package and internal crate names retain `victory` for compatibility. T
 
 ## Run and preload
 
-From that output directory:
+For a downloaded release, first run `.\Initialize-FormatTables.ps1 -Destination .\bcpack-tables.bin` in the extracted folder. Then run either program from the output directory:
 
 ```powershell
 .\nzx-play.exe 'D:\My Game\game.exe'

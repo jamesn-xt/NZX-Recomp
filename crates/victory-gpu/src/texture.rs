@@ -58,6 +58,8 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Queue fence of the last asynchronous copy from this mapping.
+    reader_fence: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
 }
@@ -664,11 +666,16 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
             staging.dirty.store(false, Relaxed);
         });
     }
+    list.track_texture_upload(staging.clone());
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }
 
 impl Staging {
+    pub(crate) fn mark_gpu_read(&self, fence: u64) {
+        self.reader_fence.store(fence, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.size)
@@ -907,6 +914,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let fence = self.reader_fence.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if fence != 0 {
+            crate::host::wait_for_texture_upload(fence);
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -1302,6 +1313,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        reader_fence: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
     map.insert(resource as usize, s.clone());

@@ -23,7 +23,6 @@ foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
 }
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1')
     & cargo build --locked --release -p victory --features diagnostics --bins
     if ($LASTEXITCODE -ne 0) { throw 'NZX Recomp build failed.' }
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
@@ -32,6 +31,7 @@ try {
         if (!(Test-Path -LiteralPath (Join-Path $release $name))) { throw "Build output missing: $name" }
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1') -Destination (Join-Path $OutputDirectory 'bcpack-tables.bin')
     foreach ($name in $names) {
         Copy-Item -LiteralPath (Join-Path $release $name) -Destination (Join-Path $OutputDirectory $name)
     }

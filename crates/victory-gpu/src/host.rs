@@ -1403,7 +1403,7 @@ fn record_twin_copy(
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|value| value != "0")
     })
 }
 
@@ -1799,6 +1799,8 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Staging allocations actually named by recorded CopyTextureRegion calls.
+    texture_uploads: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Numbered guest memory copies already prepared by this list.
     raw_copies: RawCopyCoverage,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -4641,6 +4643,11 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            for list in runs {
+                for staging in &list.deferred().texture_uploads {
+                    staging.mark_gpu_read(*submitted);
+                }
+            }
             let back = declared_writes(runs);
             let mut texture_writes = Vec::new();
             for list in runs {
@@ -5830,6 +5837,10 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    pub(crate) fn track_texture_upload(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().texture_uploads.push(staging);
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -6372,6 +6383,22 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Waits until the asynchronous queue no longer reads a staging allocation.
+pub(crate) fn wait_for_texture_upload(value: u64) {
+    let host = host().expect("texture staging has a host device");
+    // SAFETY: the queue has already enqueued this signal. A null event
+    // waits on the calling thread without consuming another caller's event.
+    let result = unsafe {
+        if host.fence.GetCompletedValue() >= value {
+            return;
+        }
+        host.fence.SetEventOnCompletion(value, HANDLE::default())
+    };
+    if let Err(e) = result {
+        fail(format_args!("texture staging fence wait failed ({e})"));
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
