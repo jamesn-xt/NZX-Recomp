@@ -701,6 +701,90 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Exercise the actual FXC-compiled card hashes on the host, including
+    /// skewed pieces and the store/compare/update modes used by the relay.
+    #[test]
+    fn card_hash_shaders_detect_changes_and_update_their_baseline() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 host: card hash GPU test skipped");
+            return;
+        };
+        const SIZE: usize = 3 * 65536;
+        for wide in [false, true] {
+            let source = if wide { crate::card_hash::CARD_COMPARE_WIDE } else { CARD_COMPARE };
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: source and entry names live through compilation;
+            // the resulting blob owns the shader and embedded root signature.
+            let (root, pso) = unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(), source.len(), windows::core::s!("card hash test"),
+                    None, None, windows::core::s!("main"), windows::core::s!("cs_5_1"),
+                    0, 0, &mut code, None,
+                ).expect("card hash compiles with the runtime's FXC path");
+                let code = code.unwrap();
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                }).unwrap();
+                (root, pso)
+            };
+            let (input, input_at) = host.shared_buffer(SIZE as u64).unwrap();
+            let (hashes, _) = host.shared_buffer(64).unwrap();
+            let (flags, flags_at) = host.shared_buffer(64).unwrap();
+            for skew in [0u32, 0x1230] {
+                // SAFETY: these mappings cover the buffers' full sizes;
+                // each CPU access is between synchronous executions.
+                unsafe {
+                    for at in 0..SIZE { input_at.add(at).write((at.wrapping_mul(37) >> 7) as u8); }
+                    flags_at.write_bytes(0xa5, 64);
+                }
+                let run = |mode: u32| {
+                    let list = host.new_list().unwrap();
+                    let constants = [1u32, skew, SIZE as u32, 2, 16, mode];
+                    // SAFETY: all root resources live through the synchronous
+                    // submission; constants describe two in-bounds pieces.
+                    unsafe {
+                        list.list.SetComputeRootSignature(&root);
+                        list.list.SetPipelineState(&pso);
+                        list.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        list.list.SetComputeRootShaderResourceView(1, input.GetGPUVirtualAddress());
+                        list.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                        list.list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
+                        let (x, y) = crate::card_hash::groups(2, wide);
+                        list.list.Dispatch(x, y, 1);
+                    }
+                    list.close();
+                    host.execute(&[&list]);
+                    // SAFETY: the submission has completed and these two
+                    // dwords lie inside the mapped result buffer.
+                    unsafe { [flags_at.add(16).cast::<u32>().read(), flags_at.add(20).cast::<u32>().read()] }
+                };
+                run(0);
+                assert_eq!(run(1), [0, 0], "wide={wide}, skew={skew}");
+                // Each boundary belongs to a different piece, including
+                // the truncated final piece of a skewed buffer.
+                for (at, expected) in [(65536 - skew as usize, [1, 0]), (SIZE - skew as usize - 1, [0, 1])] {
+                    // SAFETY: both offsets lie in the live input mapping;
+                    // the GPU is idle following run().
+                    unsafe { input_at.add(at).write(input_at.add(at).read() ^ 0x5a); }
+                    assert_eq!(run(1), expected);
+                    assert_eq!(run(1), expected, "compare must retain the old hash");
+                    assert_eq!(run(2), expected, "compare-and-store reports the change");
+                    assert_eq!(run(1), [0, 0], "updated hash becomes the baseline");
+                }
+                // SAFETY: the buffer is mapped and all GPU work is done.
+                let flags = unsafe { std::slice::from_raw_parts(flags_at, 64) };
+                assert!(flags[..16].iter().chain(&flags[24..]).all(|&b| b == 0xa5));
+            }
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
