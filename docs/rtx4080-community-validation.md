@@ -50,9 +50,35 @@ The working branch additionally carries:
 - #699: signature element order and interpolation-mode consistency, allowing
   additional shaders through validation (Mohammed Wasif Ahmed).
 
-The five tests selected by the `remap` filter passed before #699. A separate
-full run of the changed GPU, formats and shader crates is required for this
-newer revision. Do not attribute the checkpoint's 570-test result to it.
+Revision `2294a5e` passed **420 tests, 0 failed, 10 ignored** across the complete
+GPU, formats and shader crates. Its release build passed. Executable SHA-256:
+`7ECC3FE4F217D76B47CBD575897FD6BF354B61CCB94984BC2A571D722471CE5F`.
+The matching executable, source and checksums are published as the
+[`rtx4080-material-test-20261125` prerelease](https://github.com/jamesn-xt/VIctory/releases/tag/rtx4080-material-test-20261125).
+Its runtime evaluation remains separate from the original checkpoint.
+
+## Same-submission texture uploads
+
+Branch `test/rtx4080-texture-prelude` additionally adapts Adrito's #80. A changed
+title texture is copied from refreshed staging in the submission's prelude,
+before that submission uses it. Copies no longer depend on a dirty flag sampled
+earlier while recording the main command list.
+
+Both GPU regressions failed on the preceding code: changing `0x11` to `0x22`
+still read `0x11`, and changing `0x33` to `0x44` after a two-list submission
+still read `0x33`. Both pass with the adaptation. The full GPU suite passes:
+**175 passed, 0 failed, 3 ignored**, with `VICTORY_D3D12_DEBUG=1` requested.
+
+Staging lifetime protection remains: only staging buffers actually copied by a
+prelude are marked in flight; unchanged refreshes do not wait, while detiling
+waits for the prior reader. The existing staging-fence regression was adapted
+to check actual submission-time copies and passes. The adaptive hash polling
+for recently changing view memory remains; its earlier inline-copy decision is
+superseded by the prelude. Runtime flicker and performance are not yet proven
+fixed by these tests.
+
+Clippy initially found an upstream `unnecessary_sort_by` warning in `draw.rs`;
+the equivalent reverse-key sort is used on this branch.
 
 ## Reproduce
 
