@@ -41,6 +41,22 @@ The later texture-prelude build at `766a71a` also reaches that textured view.
 Its bounded runtime/input evaluation and the in-flight-fetch comparison are
 tracked separately from the unit-test results above.
 
+The bounded comparison has now completed. Quiet window-view samples from seconds
+420–500 were 227.0 ms / 4.41 fps with the texture-prelude build (16 samples), and
+210.9 ms / 4.74 fps with in-flight fetch enabled (15 samples). Sampled p95 values
+were 246.9 and 225.5 ms. After backward movement and camera input, seconds
+580–620 were 258.8 ms / 3.86 fps and 226.1 ms / 4.42 fps respectively. The final
+views differ: about 5,960 draws in the former versus 5,400 in the latter. Cache,
+view and code differences prevent attributing an exact percentage to the switch.
+Background compilation/testing began after the selected comparison windows;
+later samples include that load and should not be used for this comparison.
+
+The enabled path used 1,024 slots and reported no separate fetch waits or slot
+overflow in the observed steady lines. Both runs showed clothing, cell-wall and
+floor detail, bunks, a cellmate, and the wire window mesh. Both ended deliberately
+(replacement or the configured time limit), without observed device loss. This
+is limited scene/input validation, not complete playability or a 30 fps result.
+
 ## Launcher
 
 `scripts/Launch-PerformanceProfile.ps1` takes explicit local game, configuration
@@ -71,3 +87,29 @@ existing slot time, not additional frame costs. In the texture-prelude run the
 whole slot stage sometimes took around 88 ms/frame; this split will show which
 part deserves optimization. It changes timing/logging only. Workspace Clippy
 and release compilation pass; a runtime measurement of the split is pending.
+
+## Following CPU and descriptor corrections
+
+`ed29794` merges upstream `9376fd6`: recent draw-table slots are left to their
+draws during descriptor synchronization, and known guarded view memory avoids
+failing GetWriteWatch calls. Page-batched locking is retained, using upstream's
+multiply-and-fold record print. A new regression verifies that deferring a table
+does not consume its record fingerprint, so expiry still resynchronizes it.
+This merged source passed the complete serialized all-feature workspace suite:
+**589 passed, 0 failed, 10 ignored**, plus workspace Clippy with `-D warnings`.
+
+The next branch, `test/rtx4080-captured-descriptors` at `494f51a`, adapts Yusuf
+Al-Khawaldeh's #792. The old path fingerprinted captured record A but reread live
+record B when installing the descriptor; A returning later was then skipped.
+That installed-key regression failed locally before the fix. The batched path
+now retains each changed record's immutable 12-byte header and publishes that
+same header, while ordinary API mirroring keeps its existing live-read path.
+
+The two focused sampler regressions pass on the RTX 4080 and WARP, including a
+fenced shader-output check with independent clamp/wrap/decoy values. The complete
+GPU suite passes **185 tests, 0 failed, 3 ignored**; workspace Clippy and the
+diagnostics release build pass. This is additional GPU validation, not a claim
+that the full workspace suite was rerun on this child revision. The executable
+SHA-256 is `A6A3DE82020241AD3D39C221C5CA60B047C90D0D9FC0096B972AF2404D71BCF0`.
+Its bounded title run is in progress. These tests do not establish that a
+particular title draw reaches the sampler race or that all flicker is fixed.
