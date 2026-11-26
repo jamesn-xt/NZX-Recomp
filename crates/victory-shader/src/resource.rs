@@ -224,9 +224,9 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -411,13 +411,22 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The instruction site of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
+
+/// The lanes that reach the block and execute this specific access.
+fn access_predicates(lanes: &Structured, (block, instruction): Site) -> Known {
+    let mut known = vec![(lanes.reach[block], true)];
+    if let Some(guard) = lanes.guards[block][instruction] {
+        known.push((guard, true));
+    }
+    known
+}
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
@@ -1113,8 +1122,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1122,8 +1131,7 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        let mut known = self.lanes.map_or_else(Vec::new, |lanes| access_predicates(lanes, at));
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1275,7 +1283,7 @@ impl<'a> Tracer<'a> {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = access_predicates(lanes, at);
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -2590,6 +2598,32 @@ pub(crate) mod tests {
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn an_exec_guard_can_exclude_the_uninitialised_descriptor_edge() {
+        let words = [
+            0xBE89_0380u32, // s_mov_b32 s9, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> restore
+            0xF408_0004,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[8:9], 0
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xE000_2000,
+            0x8000_0400, // buffer_load_format_x v4, v0, s[0:3], 0 idxen
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let program = crate::ir::build(&code, false, 16).unwrap();
+        let layout = [param(Table, 8, 1)];
+        let lanes = crate::structure::structure(&program).unwrap();
+        let resources = track(&program, &layout, HwStage::Cs, Some(&lanes)).unwrap();
+        assert_eq!(resources.descriptors.len(), 1);
+        let descriptor = &resources.descriptors[0];
+        assert!(lanes.guards[descriptor.site.0][descriptor.site.1].is_some());
+        assert!(matches!(descriptor.source, Source::Loaded { first: 0, .. }));
     }
 
     /// Two paths add an index to one table in the code and meet before one load
