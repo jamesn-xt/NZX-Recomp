@@ -1,10 +1,66 @@
 //! Rendezvous sites for a workgroup of independently scheduled guest waves.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::{ShaderError, ir};
 
 type Cursor = (usize, usize);
+
+/// SSA values to keep when a wave yields at the end of a block. Phi
+/// destinations live on entry to the successor, but it is their operand on
+/// this particular edge that the suspended wave must save.
+pub(super) fn resume_values(
+    program: &ir::Program,
+    block: usize,
+) -> Vec<(usize, BTreeSet<ir::Value>)> {
+    let mut entries = vec![BTreeSet::new(); program.blocks.len()];
+    let edge = |from: usize, to: usize, entries: &[BTreeSet<ir::Value>]| {
+        let target = &program.blocks[to];
+        let pred = target
+            .preds
+            .iter()
+            .position(|&p| p == from)
+            .expect("IR predecessor");
+        let mut live = entries[to].clone();
+        for phi in &target.phis {
+            live.remove(&phi.value);
+        }
+        for phi in &target.phis {
+            if entries[to].contains(&phi.value) {
+                live.insert(phi.args[pred]);
+            }
+        }
+        live
+    };
+    loop {
+        let mut changed = false;
+        for (index, current) in program.blocks.iter().enumerate().rev() {
+            let mut live = BTreeSet::new();
+            for next in current.exit.successors() {
+                live.extend(edge(index, next, &entries));
+            }
+            for inst in current.insts.iter().rev() {
+                for (_, value) in &inst.writes {
+                    live.remove(value);
+                }
+                live.extend(inst.reads.iter().map(|(_, value)| *value));
+            }
+            if entries[index] != live {
+                entries[index] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    program.blocks[block]
+        .exit
+        .successors()
+        .into_iter()
+        .map(|next| (next, edge(block, next, &entries)))
+        .collect()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Phase {
@@ -153,5 +209,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn suspended_loop_keeps_the_updated_scalar_only_on_the_back_edge() {
+        let words: [u32; 5] = [
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x8102_8102, // s_add_i32 s2, s2, 1
+            0xBF06_0102, // s_cmp_eq_u32 s2, s1
+            0xBF84_FFFD, // s_cbranch_scc0 back to the add
+            0xBF81_0000,
+        ];
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let program = ir::build(&bytes, true, 1).unwrap();
+        let body = &program.blocks[1];
+        let accumulator = body.insts[0].write(ir::Reg::S(2)).unwrap();
+        let bound = body.insts[1].read(ir::Reg::S(1)).unwrap();
+        let edges = resume_values(&program, 1);
+        assert_eq!(edges[0], (1, BTreeSet::from([accumulator, bound])));
+        assert!(edges[1].1.is_empty());
     }
 }

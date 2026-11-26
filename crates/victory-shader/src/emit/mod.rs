@@ -559,6 +559,15 @@ pub fn emit(
                     eprintln!("WAVE64-PHASES guest barrier sites: {sites:#x?}");
                 }
                 if let Some(offset) = phases.iter().find_map(|phase| phase.first_back_edge) {
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some()
+                        && let Some(index) = p.blocks.iter().position(|block|
+                            block.insts.last().is_some_and(|i| i.machine.offset == offset))
+                    {
+                        for (next, values) in wave_phases::resume_values(p, index) {
+                            eprintln!("WAVE64-RESUME {offset:#x} -> {:#x}: {} live SSA dwords",
+                                p.blocks[next].offset, values.len());
+                        }
+                    }
                     return Err(ShaderError::Unsupported {
                         offset,
                         what: "a loop before a group barrier needs independent guest wave scheduling on Wave32",
