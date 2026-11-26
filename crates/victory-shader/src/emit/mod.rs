@@ -103,6 +103,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod wave_phases;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -548,6 +549,22 @@ pub fn emit(
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {
         if native.stage == HwStage::Cs && wave == Some(64) && lower::host_max_wave() == 32 {
+            if p.wave64
+                && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
+                && p.blocks.iter().any(|block| block.insts.iter().any(|inst| inst.name() == "s_barrier"))
+            {
+                let phases = wave_phases::plan(p)?;
+                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    let sites: Vec<_> = phases.iter().map(|phase| phase.barrier).collect();
+                    eprintln!("WAVE64-PHASES guest barrier sites: {sites:#x?}");
+                }
+                if let Some(offset) = phases.iter().find_map(|phase| phase.first_back_edge) {
+                    return Err(ShaderError::Unsupported {
+                        offset,
+                        what: "a loop before a group barrier needs independent guest wave scheduling on Wave32",
+                    });
+                }
+            }
             return Err(ShaderError::Unsupported {
                 offset: 0,
                 what: "no wave32 lowering for this wave64 compute program",
