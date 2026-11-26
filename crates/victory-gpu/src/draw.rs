@@ -333,6 +333,24 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
+static SCENE_DROPS: AtomicU64 = AtomicU64::new(0);
+static SCENE_CENSUS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub(crate) fn scene_draw_counts() -> (u64, u64) {
+    (drawn(), SCENE_DROPS.swap(0, Ordering::Relaxed))
+}
+
+pub(crate) fn scene_texture_census_current() -> bool {
+    SCENE_CENSUS_FRAME.load(Ordering::Relaxed) == crate::frame::current()
+}
+
+fn graphics_drop() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    if crate::scene_cover::enabled() {
+        SCENE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
@@ -1758,6 +1776,7 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        SCENE_CENSUS_FRAME.store(frame, Ordering::Relaxed);
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2376,7 +2395,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            graphics_drop();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2772,7 +2791,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            graphics_drop();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2873,7 +2892,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            graphics_drop();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }

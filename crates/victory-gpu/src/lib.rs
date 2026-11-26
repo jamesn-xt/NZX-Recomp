@@ -29,6 +29,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod hdr;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;
 #[cfg(windows)]
@@ -48,6 +50,8 @@ pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod root;
+#[cfg(any(windows, test))]
+mod scene_cover;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

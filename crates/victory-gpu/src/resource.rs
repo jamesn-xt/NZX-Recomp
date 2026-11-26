@@ -307,6 +307,11 @@ pub(crate) fn stands_in(this: This) -> bool {
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
 }
 
+#[cfg(windows)]
+pub(crate) fn expanded_hdr(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 67 && stands_in(this)
+}
+
 /// Depth textures the title also asks unordered access for (the console
 /// allows both; the host copy loses the unordered access): how many were
 /// made, and how often such a texture was bound as the depth target,
@@ -661,6 +666,16 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// The host rows corresponding to a title RGB9E5 footprint when the
+    /// texture has been promoted to RGBA16_FLOAT.
+    #[cfg(windows)]
+    pub(crate) fn expanded_hdr_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+        if self.format != 67 || self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
+        PlacedFootprint { format: 10, ..*self }.host_rows()
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -3058,15 +3073,32 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        test_texture_transfer(28);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_hdr_reaches_the_host_texture_and_round_trips_to_title_memory() {
+        test_texture_transfer(67);
+    }
+
+    #[cfg(windows)]
+    fn test_texture_transfer(format: u32) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
+            assert_ne!(format, 67, "the HDR transfer test requires a D3D12 device");
             return; // no host GPU here
         };
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
         let (mut image, mut source) = (null, null);
-        let rgba = texture(4, 4, 28, 1);
+        let hdr = format == 67;
+        let width = if hdr { 40 } else { 4 };
+        let mut rgba = texture(width as u64, 4, format, 1);
+        if hdr {
+            rgba.flags = 1; // Render target: requires the stand-in.
+        }
         assert_eq!(
             create_committed(
                 null,
@@ -3096,8 +3128,25 @@ mod tests {
         let (data, _) = buffer_bytes(source).unwrap();
         // SAFETY: the buffer holds 1024 bytes.
         let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
+        if hdr {
+            // WARP can expose the native format as a render target.
+            let host_texture = host_resource(image).expect("HDR host texture");
+            // SAFETY: the texture was just created and is still live.
+            let host_format = unsafe { host_texture.GetDesc() }.Format.0;
+            assert!(matches!(host_format, 10 | 67), "unexpected format {host_format}");
+            assert_eq!(expanded_hdr(image), host_format == 10);
+            eprintln!("RGB9E5 host texture uses DXGI format {host_format}");
+            for row in 0..4 {
+                for pixel in 0..width as usize {
+                    let v = ((row * 31 + pixel) as u32) | (300 << 9) | (170 << 18) | (23 << 27);
+                    let offset = row * 256 + pixel * 4;
+                    bytes[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        } else {
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
         }
 
         let queue_iid = guid(
@@ -3141,8 +3190,8 @@ mod tests {
         }
         let rows = PlacedFootprint {
             offset: 0,
-            format: 28,
-            width: 4,
+            format,
+            width,
             height: 4,
             depth: 1,
             row_pitch: 256,
@@ -3160,6 +3209,26 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+        if hdr {
+            let mut output = null;
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut output), S_OK);
+            let output_rows = Location { resource: output, kind: 1, footprint: rows };
+            slot::<Copy>(list, 0x80)(list, &output_rows, 0, 0, 0, &to, null.cast());
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            let (output_data, _) = buffer_bytes(output).unwrap();
+            // SAFETY: execution finished and both title buffers hold 1024 bytes.
+            let actual = unsafe { std::slice::from_raw_parts(output_data, 1024) };
+            for row in 0..4 {
+                let at = row * 256;
+                let end = at + width as usize * 4;
+                assert_eq!(&actual[at..end], &bytes[at..end], "row {row}");
+            }
+            for object in [list, allocator, queue, output, source, image] {
+                slot::<Release>(object, 0x10)(object);
+            }
+            return;
+        }
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 

@@ -583,15 +583,35 @@ impl TextureQueue {
     /// backlog of unmapped or partial textures cannot use the whole pass.
     /// Among first looks, take the newest and oldest writes in turns.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again = Vec::new();
         let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((index, w.write));
         }
-        again.sort_unstable_by_key(|&(_, write)| write);
-        fresh.sort_unstable_by_key(|&(_, write)| write);
         let count = max.min(again.len() + fresh.len());
+        // Only the newest retries can be served in this pass. First looks
+        // alternate ends, so neither end can contribute more than half
+        // the budget, rounded up. Keep the same order without sorting
+        // slots in the middle of a large backlog.
+        let by_write = |&(_, write): &(u32, u64)| write;
+        if again.len() > count {
+            let skip = again.len() - count;
+            again.select_nth_unstable_by_key(skip, by_write);
+            again.drain(..skip);
+        }
+        let per_end = count.div_ceil(2);
+        if fresh.len() > 2 * per_end {
+            let high = fresh.len() - per_end;
+            fresh.select_nth_unstable_by_key(per_end, by_write);
+            fresh[per_end..].select_nth_unstable_by_key(high - per_end, by_write);
+            fresh.drain(per_end..high);
+        }
+        again.sort_unstable_by_key(by_write);
+        fresh.sort_unstable_by_key(by_write);
         let mut fresh = fresh.into_iter();
         // A time-limited pass may stop after one slot. Rotate its first
         // choice across frames as well as rotating within each pass.
@@ -2038,6 +2058,20 @@ macro_rules! once {
 }
 
 /// A view description from its words, with the format as the host has it.
+/// Preserve RGB9E5's implicit one in any channel mapped to source alpha.
+fn rgb9e5_components(mut mapping: u32) -> u32 {
+    let mask = D3D12_SHADER_COMPONENT_MAPPING_MASK;
+    let alpha = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3.0 as u32;
+    let one = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1.0 as u32;
+    for channel in 0..4 {
+        let shift = channel * D3D12_SHADER_COMPONENT_MAPPING_SHIFT;
+        if (mapping >> shift) & mask == alpha {
+            mapping = (mapping & !(mask << shift)) | (one << shift);
+        }
+    }
+    mapping
+}
+
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -2722,6 +2756,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(d) = &mut desc
+                    && d.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+                    && crate::resource::expanded_hdr(resource)
+                {
+                    d.Shader4ComponentMapping = rgb9e5_components(d.Shader4ComponentMapping);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -3474,6 +3514,32 @@ mod tests {
         assert!(record_remap(&mut ranges, 50, 60, 1));
         assert!(!record_remap(&mut ranges, 70, 80, 1));
         assert_eq!(ranges, [(0, u64::MAX)]);
+    }
+
+    #[test]
+    fn capped_texture_pass_matches_the_head_of_a_full_pass() {
+        let mut queue = TextureQueue::default();
+        for slot in (0..128).rev() {
+            queue.written(slot, 0, 0, false);
+            if slot % 3 == 0 {
+                let write = queue.writes;
+                queue.later(slot, write, 0, 16);
+            }
+        }
+        for frame in 4..8 {
+            let all = queue.due(frame, usize::MAX);
+            for limit in 0..128 {
+                assert_eq!(queue.due(frame, limit), all[..limit]);
+            }
+        }
+    }
+
+    #[test]
+    fn rgb9e5_view_keeps_implicit_alpha_in_each_swizzled_channel() {
+        let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        assert_eq!(rgb9e5_components(mapping), (mapping & !(7 << 9)) | (5 << 9));
+        let swizzled = 4096 | 3 | (4 << 3) | (2 << 6) | (2 << 9);
+        assert_eq!(rgb9e5_components(swizzled), (swizzled & !7) | 5);
     }
 
     #[test]

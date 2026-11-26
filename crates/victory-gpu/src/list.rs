@@ -995,7 +995,8 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        let hdr_upload = src.kind == FOOTPRINT && crate::resource::expanded_hdr(dst.resource);
+        if !hdr_upload && unlike(dst.resource, src.resource) {
             return;
         }
         let mut from = src;
@@ -1009,18 +1010,47 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let (upload_bytes, expanded_rows) = if hdr_upload {
+                let Some((footprint, [size, row, rows, pitch])) = src.footprint.expanded_hdr_rows() else {
+                    return;
+                };
+                if rows > 1 && pitch < row / 2 {
+                    return;
+                }
+                from.footprint = footprint;
+                (size, Some([row as usize, rows as usize, pitch as usize]))
+            } else {
+                (bytes, None)
+            };
+            let Some((buffer, staging)) = list.upload(host, upload_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if let Some([row, rows, pitch]) = expanded_rows {
+                let (src, dst) = (data as usize, staging as usize);
+                let host_pitch = row.next_multiple_of(256);
+                list.defer_host(move || {
+                    let mut packed = vec![0; row / 2];
+                    for line in 0..rows {
+                        let from = src.wrapping_add(line * pitch) as *const u8;
+                        crate::host::copy_mapped(packed.as_mut_ptr(), from, packed.len(), false);
+                        // SAFETY: the expanded footprint reserved these rows in the upload buffer.
+                        let to = unsafe {
+                            std::slice::from_raw_parts_mut((dst + line * host_pitch) as *mut u8, row)
+                        };
+                        crate::hdr::expand_row(&packed, to);
+                    }
+                });
+            } else {
+                list.defer_fill(staging, data, bytes as usize);
+            }
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, upload_bytes));
             }
             _upload = buffer;
         } else {
@@ -1115,7 +1145,19 @@ fn read_back(
         return Err("a destination corner other than the footprint's");
     }
     let host = crate::host::host().ok_or("no host")?;
-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+    let hdr = crate::resource::expanded_hdr(src.resource);
+    let (footprint, [size, host_row, rows, pitch]) = if hdr {
+        if !source_box.is_null() {
+            return Err("a cropped expanded HDR transfer");
+        }
+        dst.footprint.expanded_hdr_rows().ok_or("an incompatible HDR footprint")?
+    } else {
+        dst.footprint.host_rows().ok_or("an unknown format")?
+    };
+    let row = if hdr { host_row / 2 } else { host_row };
+    if hdr && rows > 1 && pitch < row {
+        return Err("HDR row pitch is smaller than a row");
+    }
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
@@ -1148,7 +1190,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], hdr);
     Ok(())
 }
 

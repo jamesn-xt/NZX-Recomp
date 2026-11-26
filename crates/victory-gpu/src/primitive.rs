@@ -107,7 +107,7 @@ impl Kind {
     }
 }
 
-fn half_to_f32(h: u16) -> f32 {
+pub(crate) fn half_to_f32(h: u16) -> f32 {
     let sign = u32::from(h >> 15) << 31;
     let exp = u32::from((h >> 10) & 0x1f);
     let man = u32::from(h & 0x3ff);
@@ -124,7 +124,7 @@ fn half_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn f32_to_half(v: f32) -> u16 {
+pub(crate) fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
