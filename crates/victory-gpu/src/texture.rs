@@ -1148,6 +1148,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // The owned snapshot outlives the mapping lock. Detiling
+                // may wait on an earlier upload fence.
+                drop(_mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1168,6 +1171,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
+                drop(_mapped);
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1189,7 +1193,11 @@ impl Staging {
         if !self.observe_hash(last, hash, frame) {
             return size;
         }
-        self.detile(tiled, wait_flight);
+        with_read(size, |read| {
+            read.copy_from_slice(tiled);
+            drop(_mapped);
+            self.detile(read, wait_flight);
+        });
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
