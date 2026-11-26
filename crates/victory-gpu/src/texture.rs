@@ -1074,22 +1074,7 @@ impl Staging {
             last.partial = None;
         }
         let frame = crate::frame::current();
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            last.motion = Motion::default();
-            if !remapped && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
-            }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read, wait_flight);
-            });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
-        }
+
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
         // where two textures change (run 58). It is guarded now, as buffers
@@ -1101,15 +1086,31 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+        let guard = *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"));
+        if let Some((now, written, guarded)) =
+            waited(1, || crate::watch::writes_with_source(start, start + size, guard))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if !remapped && unwritten && !turn && !last.motion.active(frame) {
-                return 0;
+            if guarded {
+                const HASH_EVERY: u64 = 8;
+                let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+                if !remapped && unwritten && !turn && !last.motion.active(frame) {
+                    return 0;
+                }
+            } else {
+                last.motion = Motion::default();
+                if !remapped && unwritten {
+                    return 0;
+                }
+                // Read through the copy, which stands unmapped pages.
+                with_read(size, |read| {
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    self.detile(read, wait_flight);
+                });
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                return size;
             }
         }
         // From here on the texture's memory may be read in place. Held until

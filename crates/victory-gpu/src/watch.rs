@@ -331,6 +331,17 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with_source(start, end, guarded).map(|(now, pages, _)| (now, pages))
+}
+
+/// The same journal lookup, with a flag for pages reported by the guards.
+/// Textures can use the flag to keep their periodic hash for guarded views
+/// without trying the kernel write watch a second time.
+pub(crate) fn writes_with_source(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -344,6 +355,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
+            false,
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -399,8 +411,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in j.found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
         j.written.insert(page, now);
     }
     Some((
@@ -409,6 +420,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
+        failed,
     ))
 }
 
@@ -1030,11 +1042,13 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The address may have been used by another test in this process.
+        let (before, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
+        let (now, mut after, guarded) = writes_with_source(start, end, true).expect("watched");
+        assert!(!guarded);
+        after.retain(|&(_, generation)| generation > before);
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
@@ -1075,7 +1089,8 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let (_, _, guarded) = writes_with_source(view, view + 2 * BLOCK, true).expect("guarded view");
+        assert!(guarded);
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
