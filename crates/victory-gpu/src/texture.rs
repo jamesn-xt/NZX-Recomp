@@ -1362,6 +1362,12 @@ pub(crate) fn is_staged(resource: This) -> bool {
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
+/// Calls and microseconds for heap admission scans and staging checks,
+/// followed by the staging checks skipped for already-partial textures.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_RESIDENCY: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Staging bytes and, if requested, whether all the backing pages are present.
 /// A slot already known to be partial only needs the byte count.
 pub(crate) fn staged(resource: This, check_whole: bool) -> Option<(u64, bool)> {
@@ -1370,7 +1376,18 @@ pub(crate) fn staged(resource: This, check_whole: bool) -> Option<(u64, bool)> {
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, check_whole && committed(s.memory, size)))
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let whole = check_whole && committed(s.memory, size);
+    #[cfg(feature = "diagnostics")]
+    if check_whole {
+        use std::sync::atomic::Ordering::Relaxed;
+        HEAP_RESIDENCY[2].fetch_add(1, Relaxed);
+        HEAP_RESIDENCY[3].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    } else {
+        HEAP_RESIDENCY[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some((size as u64, whole))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1513,7 +1530,16 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// Count committed bytes exactly for heap texture admission. Sampling one
 /// 4 KiB page per 64 KiB block can miss a mip or mark it complete too soon.
 pub(crate) fn resident_bytes(at: usize, len: usize) -> u64 {
-    mapped_regions(at, at.saturating_add(len))
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let mapped = mapped_regions(at, at.saturating_add(len));
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        HEAP_RESIDENCY[0].fetch_add(1, Relaxed);
+        HEAP_RESIDENCY[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
+    mapped
 }
 
 fn mapped_regions(start: usize, end: usize) -> u64 {
