@@ -24,7 +24,32 @@ impl Cover {
 
 #[cfg(windows)]
 pub(crate) fn enabled() -> bool {
-    mode().is_some()
+    use std::sync::atomic::Ordering::Relaxed;
+    mode().is_some() && !FINISHED.load(Relaxed)
+}
+
+#[cfg(windows)]
+static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(crate) enum Blocker {
+    Graphics,
+    Compute,
+    Indirect,
+    Texture,
+    Transfer,
+    Geometry,
+}
+
+#[cfg(windows)]
+static BLOCKERS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg(windows)]
+pub(crate) fn note(blocker: Blocker) {
+    if enabled() {
+        BLOCKERS[blocker as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(windows)]
@@ -41,6 +66,9 @@ fn mode() -> Option<bool> {
 pub(crate) fn hold(frame: u64) -> bool {
     use std::sync::{Mutex, atomic::Ordering};
 
+    if !enabled() {
+        return false;
+    }
     let Some(enforce) = mode() else { return false };
     static STATE: Mutex<(Cover, u64, u64)> = Mutex::new((Cover {
         quiet: 0, started: false, finished: false,
@@ -50,25 +78,49 @@ pub(crate) fn hold(frame: u64) -> bool {
     if cover.finished {
         return false;
     }
-    let (drawn, dropped) = crate::draw::scene_draw_counts();
-    let draws = drawn.saturating_sub(*previous_draws) + dropped;
+    let drawn = crate::draw::drawn();
+    let blockers = BLOCKERS.each_ref().map(|value| value.swap(0, Ordering::Relaxed));
+    let [graphics, compute, indirect, texture, transfer, geometry] = blockers;
+    let draws = drawn.saturating_sub(*previous_draws) + graphics;
     *previous_draws = drawn;
     let [queued, due, waiting, partial, _] =
         crate::draw::HEAP_TEXTURES_QUEUE.each_ref().map(|count| count.load(Ordering::Relaxed));
     let census_current = crate::draw::scene_texture_census_current();
     let was_started = cover.started;
-    let hold = cover.hold(draws, census_current && dropped == 0 && queued == 0);
+    let ready = assets_ready(census_current, queued, blockers);
+    let hold = cover.hold(draws, ready);
+    if cover.finished {
+        FINISHED.store(true, Ordering::Relaxed);
+    }
     if cover.started && (!was_started || !hold || frame.saturating_sub(*last_log) >= 60) {
         *last_log = frame;
-        tracing::info!(frame, draws, dropped, queued, due, waiting, partial, census_current, hold, enforce,
+        tracing::info!(frame, draws, graphics, compute, indirect, texture, transfer, geometry,
+            queued, due, waiting, partial, census_current, hold, enforce,
             "first scene presentation readiness");
     }
     enforce && hold
 }
 
+#[cfg(any(windows, test))]
+fn assets_ready(census_current: bool, queued: u64, blockers: [u64; 6]) -> bool {
+    census_current && queued == 0 && blockers == [0; 6]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cover;
+    use super::{Cover, assets_ready};
+
+    #[test]
+    fn pending_work_in_any_render_path_holds_even_with_an_empty_texture_queue() {
+        for slot in 0..6 {
+            let mut blockers = [0; 6];
+            blockers[slot] = 1;
+            assert!(!assets_ready(true, 0, blockers));
+        }
+        assert!(!assets_ready(false, 0, [0; 6]));
+        assert!(!assets_ready(true, 1, [0; 6]));
+        assert!(assets_ready(true, 0, [0; 6]));
+    }
 
     #[test]
     fn holds_the_first_heavy_scene_through_incomplete_frames() {

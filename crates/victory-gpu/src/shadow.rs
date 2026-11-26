@@ -1442,10 +1442,33 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+struct Completion {
+    left: std::sync::atomic::AtomicUsize,
+    wait: Mutex<()>,
+    done: std::sync::Condvar,
+}
+
+struct Work {
+    job: Job,
+    completion: Arc<Completion>,
+}
+
+impl Work {
+    fn run(self) {
+        (self.job)();
+        if self.completion.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Pair with the waiting thread's predicate check so that the
+            // last completion can't signal just before it starts waiting.
+            let _wait = self.completion.wait.lock().unwrap_or_else(|e| e.into_inner());
+            self.completion.done.notify_all();
+        }
+    }
+}
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    jobs: Mutex<std::collections::VecDeque<Work>>,
     more: std::sync::Condvar,
 }
 
@@ -1471,7 +1494,7 @@ fn workers() -> &'static Workers {
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    job();
+                    job.run();
                 }
             });
         }
@@ -1489,32 +1512,26 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let completion = Arc::new(Completion {
+        left: std::sync::atomic::AtomicUsize::new(jobs.len()),
+        wait: Mutex::new(()),
+        done: std::sync::Condvar::new(),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for job in jobs {
-            let left = left.clone();
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
-        }
+        queue.extend(jobs.into_iter().map(|job| Work { job, completion: completion.clone() }));
     }
     workers.more.notify_all();
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
-            Some(job) => job(),
+            Some(job) => job.run(),
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    let mut wait = completion.wait.lock().unwrap_or_else(|e| e.into_inner());
+    while completion.left.load(Ordering::Acquire) != 0 {
+        wait = completion.done.wait(wait).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1734,6 +1751,28 @@ mod wide_tests {
             wide(jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
         }
+    }
+
+    #[test]
+    fn concurrent_batches_wait_for_their_own_jobs() {
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for n in [257usize, 511] {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..8 {
+                        let ran = Arc::new(AtomicUsize::new(0));
+                        let jobs = (0..n).map(|_| {
+                            let ran = ran.clone();
+                            Box::new(move || { ran.fetch_add(1, Ordering::Relaxed); }) as Job
+                        }).collect();
+                        wide(jobs);
+                        assert_eq!(ran.load(Ordering::Relaxed), n);
+                    }
+                });
+            }
+        });
     }
 
     /// Copies cut into jobs copy every byte once: long ones, short ones

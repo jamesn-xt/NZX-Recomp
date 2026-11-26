@@ -872,6 +872,7 @@ extern "system" fn copy_buffer_region(
 fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
+        crate::scene_cover::note(crate::scene_cover::Blocker::Transfer);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
@@ -972,6 +973,12 @@ extern "system" fn copy_texture_region(
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
+            if made.is_err()
+                && crate::scene_cover::enabled()
+                && crate::resource::expanded_hdr(src.resource)
+            {
+                crate::scene_cover::note(crate::scene_cover::Blocker::Transfer);
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -1012,9 +1019,11 @@ extern "system" fn copy_texture_region(
             };
             let (upload_bytes, expanded_rows) = if hdr_upload {
                 let Some((footprint, [size, row, rows, pitch])) = src.footprint.expanded_hdr_rows() else {
+                    crate::scene_cover::note(crate::scene_cover::Blocker::Transfer);
                     return;
                 };
                 if rows > 1 && pitch < row / 2 {
+                    crate::scene_cover::note(crate::scene_cover::Blocker::Transfer);
                     return;
                 }
                 from.footprint = footprint;
@@ -1779,11 +1788,15 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        crate::scene_cover::note(crate::scene_cover::Blocker::Indirect);
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    #[cfg(windows)]
+    let mut required = true;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
@@ -1792,6 +1805,9 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
+            if crate::scene_cover::enabled() {
+                required = !s.disabled_builder();
+            }
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -1804,6 +1820,10 @@ extern "system" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    #[cfg(windows)]
+    if required {
+        crate::scene_cover::note(crate::scene_cover::Blocker::Indirect);
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());

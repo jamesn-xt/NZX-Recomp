@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     /// after `refresh` has already checked title memory for this submission.
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// A detile completed without a format or layout error.
+    detiled_ok: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Highest late-submission number (`crate::host::STARTED`) that may
@@ -710,6 +712,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// texture whenever this is the first upload or `refresh` detiled new
 /// contents.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    use crate::scene_cover::{Blocker, note};
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -721,12 +724,27 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
+        note(Blocker::Texture);
         return;
     };
     let Some(staging) = staging(resource, texture) else {
+        note(Blocker::Texture);
         return;
     };
     use std::sync::atomic::Ordering::{Relaxed, Release};
+    // These are textures reached through a table or by a dependent copy.
+    // Leaving a table's slot out of the background queue does not mean its
+    // texture made it to the card. Give a fresh upload a later frame to
+    // settle, and keep waiting when its backing pages or tiles are missing.
+    if crate::scene_cover::enabled()
+        && (!staging.uploaded.load(Relaxed)
+            || !staging.detiled_ok.load(std::sync::atomic::Ordering::Acquire)
+            || staging.remap_pending.load(Relaxed)
+            || staging.waiting.load(Relaxed) != 0
+            || !committed(staging.memory, staging.layout.size as usize))
+    {
+        note(Blocker::Texture);
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -1235,6 +1253,7 @@ impl Staging {
         }
         let started = std::time::Instant::now();
         let workers = detile_workers();
+        let mut succeeded = true;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
@@ -1258,9 +1277,11 @@ impl Staging {
             };
             if let Err(e) = result {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                succeeded = false;
                 break;
             }
         }
+        self.detiled_ok.store(succeeded && held != 0, std::sync::atomic::Ordering::Release);
         DETILE_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1576,6 +1597,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
+        detiled_ok: std::sync::atomic::AtomicBool::new(false),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),

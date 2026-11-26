@@ -1368,6 +1368,15 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// Detailed marker text is useful when tracing a fault, but formatting
+/// every command can dominate the recording threads. Benchmark profiles
+/// can keep DRED breadcrumbs and page-fault tracking with markers off.
+#[cfg(feature = "diagnostics")]
+fn detailed_markers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_MARKERS").is_none_or(|v| v != "0")) || timing()
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -6029,7 +6038,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if !dred_on() || !detailed_markers() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }

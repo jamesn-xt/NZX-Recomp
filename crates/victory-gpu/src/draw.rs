@@ -333,12 +333,7 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
-static SCENE_DROPS: AtomicU64 = AtomicU64::new(0);
 static SCENE_CENSUS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-
-pub(crate) fn scene_draw_counts() -> (u64, u64) {
-    (drawn(), SCENE_DROPS.swap(0, Ordering::Relaxed))
-}
 
 pub(crate) fn scene_texture_census_current() -> bool {
     SCENE_CENSUS_FRAME.load(Ordering::Relaxed) == crate::frame::current()
@@ -346,9 +341,7 @@ pub(crate) fn scene_texture_census_current() -> bool {
 
 fn graphics_drop() {
     DROPPED.fetch_add(1, Ordering::Relaxed);
-    if crate::scene_cover::enabled() {
-        SCENE_DROPS.fetch_add(1, Ordering::Relaxed);
-    }
+    crate::scene_cover::note(crate::scene_cover::Blocker::Graphics);
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -895,9 +888,11 @@ impl State {
             }
             count = slot + 1;
             if v.address == 0 || v.size == 0 {
+                crate::scene_cover::note(crate::scene_cover::Blocker::Geometry);
                 continue;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                crate::scene_cover::note(crate::scene_cover::Blocker::Geometry);
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -2070,16 +2065,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        use crate::scene_cover::{Blocker, note};
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            note(Blocker::Compute);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if self.disabled_builder() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -2099,14 +2096,17 @@ impl State {
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
+            note(Blocker::Compute);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            note(Blocker::Compute);
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            note(Blocker::Compute);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2900,6 +2900,10 @@ impl State {
 }
 
 impl State {
+    pub(crate) fn disabled_builder(&self) -> bool {
+        crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs()
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -2919,7 +2923,7 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if self.disabled_builder() {
             return false;
         }
         const DRAW: u32 = 0;
@@ -3194,6 +3198,12 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    if placed.is_none()
+        && matches!(view, View::Placed(false, ..))
+        && crate::descriptor::host::is_texture_view(view)
+    {
+        crate::scene_cover::note(crate::scene_cover::Blocker::Texture);
+    }
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
@@ -3220,11 +3230,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
+            if !aliased {
+                match crate::resource::host_resource(*resource as This) {
+                    Some(t) if crate::texture::title_written(t) => crate::texture::upload(list, *resource as This, t),
+                    None if crate::scene_cover::enabled() && crate::descriptor::host::is_texture_view(view) => {
+                        crate::scene_cover::note(crate::scene_cover::Blocker::Texture);
+                    }
+                    _ => {}
+                }
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
