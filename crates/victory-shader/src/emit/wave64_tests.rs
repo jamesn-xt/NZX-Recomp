@@ -449,6 +449,38 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+#[test]
+fn restored_exec_intersects_a_mask_selected_by_the_full_wave_count() {
+    let native = native(&[
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0xBE8E_046A, // s_mov_b64 s[14:15], vcc
+        0x7D84_0000, // v_cmp_eq_u32 vcc, s0, v0
+        0xBE92_106A, // s_bcnt1_i32_b64 s18, vcc
+        0x8514_8180, // s_cselect_b32 s20, 0, 1
+        0xD4C5_0028, 0x0001_0014, // v_cmp_ne_u32 s[40:41], s20, 0
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x87EA_287E, // s_and_b64 vcc, exec, s[40:41]
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBF86_0001, // s_cbranch_vccz past the scalar assignment
+        0xBE95_0381, // s_mov_b32 s21, 1
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0: one writer per group
+        0x7E00_0215, // v_mov_b32 v0, s21
+        0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16, // buffer_store_dword
+    ]);
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let shader = lowered(&native, &p, &HashSet::from([0])).expect("strict Wave32 lowering");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).unwrap();
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (count_lane, restored_lane, expected) in [(63, 0, 0), (0, 63, 0), (64, 63, 1), (64, 64, 0)] {
+        let Some(actual) = on_the_card(&shader, [count_lane, restored_lane]) else { return };
+        assert_eq!(actual, expected, "count lane {count_lane}, restored lane {restored_lane}");
+    }
+    eprintln!("full-wave count and restored EXEC passed four hardware readbacks");
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
