@@ -1353,15 +1353,15 @@ pub(crate) fn is_staged(resource: This) -> bool {
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
-/// The bytes of a title texture's memory, and whether all of it is mapped,
-/// if the texture has been staged for upload.
-pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
+/// Staging bytes and, if requested, whether all the backing pages are present.
+/// A slot already known to be partial only needs the byte count.
+pub(crate) fn staged(resource: This, check_whole: bool) -> Option<(u64, bool)> {
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    Some((size as u64, check_whole && committed(s.memory, size)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be

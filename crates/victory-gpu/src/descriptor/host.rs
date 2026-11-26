@@ -1452,15 +1452,15 @@ impl HostHeap {
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
-    /// keeps what it views). True if the slot was made.
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+    /// keeps what it views). A recording thread may have replaced the slot
+    /// while the background pass checked residency. Leave its new view alone.
+    pub(crate) fn texture_slot_gone(&self, index: u32, handle: u64, checked: [u32; 3]) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
-            return false;
+        if made.get(index as usize).is_none_or(|&key| key == 0) || super::record_at(handle) != checked {
+            return;
         }
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -3798,6 +3798,27 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    #[test]
+    fn a_residency_check_cannot_clear_a_rewritten_texture_slot() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let mut record = [super::VIEW_TAG, 10, 1, 0];
+        let handle = record.as_ptr() as u64;
+        let old = super::super::record_at(handle);
+
+        record[2] = 2;
+        let new = [record[0], record[1], record[2]];
+        assert_ne!(old, new);
+        let new_key = u64::from(new[2]) << 32 | u64::from(new[1]);
+        heap.made.lock().unwrap()[1] = new_key;
+
+        heap.texture_slot_gone(1, handle, old);
+        assert_eq!(heap.made.lock().unwrap()[1], new_key);
+        heap.texture_slot_gone(1, handle, new);
+        assert_eq!(heap.made.lock().unwrap()[1], 0);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

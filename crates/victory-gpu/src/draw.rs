@@ -1869,14 +1869,20 @@ impl State {
                 }
             }
             let mut partly = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            let Some(handle) = heap.handle(index) else {
+                host.texture_slot_done(index, write, None);
+                continue;
+            };
+            let record = crate::descriptor::record_at(handle);
+            let source_view = crate::descriptor::view_from_record(record);
+            if let Some(View::Placed(false, resource, desc)) = &source_view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 let mapped = crate::texture::resident_bytes(address as usize, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    host.texture_slot_gone(index, handle, record);
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -1896,7 +1902,7 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) = source_view
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -1917,8 +1923,7 @@ impl State {
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
             if !room {
-                let has_its_texture = reupload_when_full()
-                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                let has_its_texture = reupload_when_full() && host.texture_slot_made_from(index, handle);
                 if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
@@ -1943,7 +1948,7 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = host.mirror(index, handle, true);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1976,7 +1981,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) = crate::texture::staged(resource, partly.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
