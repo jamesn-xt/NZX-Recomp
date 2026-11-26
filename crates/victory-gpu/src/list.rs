@@ -1147,10 +1147,13 @@ fn read_back(
     let host = crate::host::host().ok_or("no host")?;
     let hdr = crate::resource::expanded_hdr(src.resource);
     let (footprint, [size, host_row, rows, pitch]) = if hdr {
-        if !source_box.is_null() {
-            return Err("a cropped expanded HDR transfer");
+        if source_box.is_null() {
+            dst.footprint.expanded_hdr_rows()
+        } else {
+            // SAFETY: the title supplies a readable D3D12_BOX for this copy.
+            dst.footprint.cropped_hdr_rows(unsafe { source_box.read() })
         }
-        dst.footprint.expanded_hdr_rows().ok_or("an incompatible HDR footprint")?
+        .ok_or("an incompatible HDR footprint")?
     } else {
         dst.footprint.host_rows().ok_or("an unknown format")?
     };

@@ -676,6 +676,19 @@ impl PlacedFootprint {
         PlacedFootprint { format: 10, ..*self }.host_rows()
     }
 
+    /// A cropped 2D copy writes only the specified width and height, at
+    /// the original title row pitch.
+    #[cfg(windows)]
+    pub(crate) fn cropped_hdr_rows(&self, region: [u32; 6]) -> Option<(PlacedFootprint, [u64; 4])> {
+        let [left, top, front, right, bottom, back] = region;
+        let width = right.checked_sub(left)?;
+        let height = bottom.checked_sub(top)?;
+        if self.depth != 1 || back.checked_sub(front)? != 1 || width > self.width || height > self.height {
+            return None;
+        }
+        PlacedFootprint { width, height, ..*self }.expanded_hdr_rows()
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -3210,10 +3223,17 @@ mod tests {
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         if hdr {
-            let mut output = null;
+            let (mut output, mut cropped) = (null, null);
             assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut output), S_OK);
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut cropped), S_OK);
             let output_rows = Location { resource: output, kind: 1, footprint: rows };
             slot::<Copy>(list, 0x80)(list, &output_rows, 0, 0, 0, &to, null.cast());
+            let expanded = expanded_hdr(image);
+            if expanded {
+                let cropped_rows = Location { resource: cropped, kind: 1, footprint: rows };
+                let region = [2u32, 1, 0, 13, 3, 1];
+                slot::<Copy>(list, 0x80)(list, &cropped_rows, 0, 0, 0, &to, region.as_ptr().cast());
+            }
             assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
             slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
             let (output_data, _) = buffer_bytes(output).unwrap();
@@ -3224,7 +3244,19 @@ mod tests {
                 let end = at + width as usize * 4;
                 assert_eq!(&actual[at..end], &bytes[at..end], "row {row}");
             }
-            for object in [list, allocator, queue, output, source, image] {
+            if expanded {
+                let (data, _) = buffer_bytes(cropped).unwrap();
+                // SAFETY: execution finished and the buffer holds 1024 bytes.
+                let actual = unsafe { std::slice::from_raw_parts(data, 1024) };
+                for row in 0..2 {
+                    let at = row * 256;
+                    let from = (row + 1) * 256 + 2 * 4;
+                    assert_eq!(&actual[at..at + 44], &bytes[from..from + 44], "cropped row {row}");
+                    assert!(actual[at + 44..at + 256].iter().all(|&byte| byte == 0));
+                }
+                assert!(actual[512..].iter().all(|&byte| byte == 0));
+            }
+            for object in [list, allocator, queue, output, cropped, source, image] {
                 slot::<Release>(object, 0x10)(object);
             }
             return;
