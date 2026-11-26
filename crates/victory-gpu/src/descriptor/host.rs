@@ -652,6 +652,16 @@ impl TextureQueue {
         }
     }
 
+    /// The old host view is gone. Even the same number of mapped bytes
+    /// needs another upload when the texture returns.
+    fn unmapped(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.mapped = 0;
+            w.checked = (0, 0, 0, 0, 0);
+        }
+        self.later(index, write, frame, most);
+    }
+
     /// The card has no room for the host copy slot `index` needs: it is
     /// not handed out again before frame `due`, or before the card has
     /// room again ([`TextureQueue::room`]). Nothing else of it changes: it
@@ -1220,9 +1230,13 @@ impl HostHeap {
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64, unmapped: bool) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        if unmapped {
+            textures.unmapped(index, write, frame, most);
+        } else {
+            textures.later(index, write, frame, most);
+        }
     }
 
     /// See [`TextureQueue::hold`].
@@ -3798,6 +3812,19 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    #[test]
+    fn an_unmapped_texture_can_upload_the_same_number_of_bytes_again() {
+        let mut queue = TextureQueue::default();
+        queue.changed(3, 1, 1);
+        let (_, write) = queue.due(1, 1)[0];
+        queue.partly(3, write, 2, 4096);
+        assert_eq!(queue.mapped(3), 4096);
+
+        queue.unmapped(3, write, 2, 16);
+        assert_eq!(queue.due(3, 1), [(3, write)]);
+        assert_eq!(queue.mapped(3), 0);
     }
 
     #[test]

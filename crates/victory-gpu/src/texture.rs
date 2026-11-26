@@ -1748,8 +1748,13 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), BLOCK as u64);
             assert_eq!(super::mapped_bytes(base.add(BLOCK - 3), 2 * BLOCK + 9), BLOCK as u64);
             assert_eq!(super::mapped_bytes(base, 2 * BLOCK), 0);
+            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), BLOCK as u64);
+            assert_eq!(super::resident_bytes(middle as usize, BLOCK), BLOCK as u64);
             assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
+            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), 0);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), BLOCK as u64);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
