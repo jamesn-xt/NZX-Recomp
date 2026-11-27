@@ -133,6 +133,9 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Subresources copied and skipped on selective texture uploads.
+    TexPartialCopied,
+    TexPartialSkipped,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1185,6 +1188,13 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
+    let partial_copied = c[C::TexPartialCopied as usize];
+    let partial_skipped = c[C::TexPartialSkipped as usize];
+    if partial_copied + partial_skipped != 0.0 {
+        tracing::info!(
+            "selective texture uploads per frame: {partial_copied:.1} subresources copied, {partial_skipped:.1} skipped"
+        );
+    }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();

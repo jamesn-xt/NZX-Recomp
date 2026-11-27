@@ -1073,6 +1073,13 @@ impl Staging {
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
+        #[cfg(feature = "diagnostics")]
+        if subresources != u64::MAX {
+            use crate::copystat::{C, add};
+            let copied = subresources.count_ones() as usize;
+            add(C::TexPartialCopied, copied as u64);
+            add(C::TexPartialSkipped, self.footprints.len().saturating_sub(copied) as u64);
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
