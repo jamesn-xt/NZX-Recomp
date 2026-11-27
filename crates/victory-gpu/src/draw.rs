@@ -1878,7 +1878,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = &source_view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
-                let mapped = crate::texture::resident_bytes(address as usize, len as usize);
+                let (mapped, first_readable) = crate::texture::heap_residency(address as usize, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1891,7 +1891,7 @@ impl State {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    if !first_readable {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);

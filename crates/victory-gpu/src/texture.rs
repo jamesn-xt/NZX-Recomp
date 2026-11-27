@@ -1530,12 +1530,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
-    mapped_regions(start, end)
+    mapped_regions(start, end).0
 }
 
 /// Count committed bytes exactly for heap texture admission. Sampling one
 /// 4 KiB page per 64 KiB block can miss a mip or mark it complete too soon.
-pub(crate) fn resident_bytes(at: usize, len: usize) -> u64 {
+pub(crate) fn heap_residency(at: usize, len: usize) -> (u64, bool) {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let mapped = mapped_regions(at, at.saturating_add(len));
@@ -1548,11 +1548,13 @@ pub(crate) fn resident_bytes(at: usize, len: usize) -> u64 {
     mapped
 }
 
-fn mapped_regions(start: usize, end: usize) -> u64 {
+/// Count readable bytes and report whether the first byte was readable.
+fn mapped_regions(start: usize, end: usize) -> (u64, bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
     let (mut p, mut there) = (start, 0u64);
+    let mut first_readable = false;
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1563,11 +1565,12 @@ fn mapped_regions(start: usize, end: usize) -> u64 {
             break;
         }
         if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            first_readable |= p == start;
             there += (next - p) as u64;
         }
         p = next;
     }
-    there
+    (there, first_readable)
 }
 
 /// The staging state of a title texture, made on first use.
@@ -1796,7 +1799,7 @@ mod title_memory_tests {
     }
 
     #[test]
-    fn a_texture_with_only_interior_pages_counts_its_resident_bytes() {
+    fn a_texture_with_only_interior_pages_counts_its_heap_residency() {
         use windows_sys::Win32::System::Memory::*;
         const BLOCK: usize = 64 << 10;
         // SAFETY: this private reservation is ours throughout the test.
@@ -1808,13 +1811,13 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), BLOCK as u64);
             assert_eq!(super::mapped_bytes(base.add(BLOCK - 3), 2 * BLOCK + 9), BLOCK as u64);
             assert_eq!(super::mapped_bytes(base, 2 * BLOCK), 0);
-            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), BLOCK as u64);
-            assert_eq!(super::resident_bytes(middle as usize, BLOCK), BLOCK as u64);
+            assert_eq!(super::heap_residency(base as usize, 5 * BLOCK), (BLOCK as u64, false));
+            assert_eq!(super::heap_residency(middle as usize, BLOCK), (BLOCK as u64, true));
             assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
-            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), 0);
+            assert_eq!(super::heap_residency(base as usize, 5 * BLOCK), (0, false));
             assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
-            assert_eq!(super::resident_bytes(base as usize, 5 * BLOCK), BLOCK as u64);
+            assert_eq!(super::heap_residency(base as usize, 5 * BLOCK), (BLOCK as u64, false));
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
