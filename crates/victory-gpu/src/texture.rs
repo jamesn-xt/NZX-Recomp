@@ -470,8 +470,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// left as it is and read at its next refresh, a frame later. A read
 /// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
 ///
-/// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// On the first refresh, a failed kernel read waits for stable mappings
+/// and uses the same sparse snapshot as the default path.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
@@ -1189,13 +1189,17 @@ impl Staging {
         // it a page went between the asking and the read in runs 71 and
         // 74).
         let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size, frame, wait_flight);
-            };
-            mapped
+            if let Some(mapped) = crate::watch::title_memory_reading_now() {
+                mapped
+            } else {
+                if let Some(bytes) = self.refresh_unlocked(last, size, frame, wait_flight) {
+                    return bytes;
+                }
+                // An indexed texture can be selected for upload only once.
+                // Wait for stable mappings before filling its first snapshot.
+                last.partial = None;
+                waited(2, crate::watch::title_memory_reading)
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1280,8 +1284,15 @@ impl Staging {
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize, frame: u64, wait_flight: &mut dyn FnMut(u64)) -> usize {
+    /// A failed read on fresh staging returns None so the caller can take
+    /// the mapping lock and copy the pages that are resident.
+    fn refresh_unlocked(
+        &self,
+        last: &mut Last,
+        size: usize,
+        frame: u64,
+        wait_flight: &mut dyn FnMut(u64),
+    ) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
@@ -1295,11 +1306,11 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
-            size
+            Some(size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
-            0
+            self.detiled_ok.load(std::sync::atomic::Ordering::Acquire).then_some(0)
         }
     }
 
@@ -1890,8 +1901,20 @@ mod remap_tests {
 
         // SAFETY: both writes are restricted to the one committed page.
         unsafe { base.cast::<u8>().write_bytes(0x68, PAGE) };
+        let size = staging.layout.size as usize;
+        let frame = crate::frame::current();
+        assert_eq!(
+            staging.refresh_unlocked(&mut super::Last::default(), size, frame, &mut no_flight),
+            None,
+            "a first snapshot with unreadable pages must use the locked path"
+        );
         staging.refresh_timed(&mut no_flight);
         assert_eq!(unsafe { *staging.data }, 0x68);
+        assert_eq!(
+            staging.refresh_unlocked(&mut super::Last::default(), size, frame, &mut no_flight),
+            Some(0),
+            "a failed read can retain an initialized snapshot"
+        );
         unsafe { base.cast::<u8>().write_bytes(0, PAGE) };
         crate::watch::title_memory_remapped(base as usize, PAGE);
         staging.refresh_timed(&mut no_flight);
