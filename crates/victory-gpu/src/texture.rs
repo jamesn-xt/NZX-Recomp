@@ -89,21 +89,30 @@ struct Last {
 
 /// Conservative detile source span for one 2D subresource. Packed mips
 /// share a block and are all affected by a write anywhere in that block.
+fn subresource_bytes(
+    layout: &victory_formats::texture::Layout,
+    mip: u32,
+    slice: u32,
+) -> std::ops::Range<usize> {
+    let m = &layout.mips[mip as usize];
+    let start = (u64::from(slice) * layout.slice_size + m.offset) as usize;
+    let bytes = if m.tail.is_some() {
+        layout.alignment as usize
+    } else {
+        m.pitch as usize * m.rows as usize * layout.desc.element_bytes as usize
+    };
+    start..start + bytes
+}
+
 fn subresource_pages(
     layout: &victory_formats::texture::Layout,
     address: usize,
     mip: u32,
     slice: u32,
 ) -> std::ops::Range<usize> {
-    let m = &layout.mips[mip as usize];
-    let start = address + (u64::from(slice) * layout.slice_size + m.offset) as usize;
-    let bytes = if m.tail.is_some() {
-        layout.alignment as usize
-    } else {
-        m.pitch as usize * m.rows as usize * layout.desc.element_bytes as usize
-    };
+    let bytes = subresource_bytes(layout, mip, slice);
     let page = crate::watch::PAGE;
-    start / page..(start + bytes).div_ceil(page)
+    (address + bytes.start) / page..(address + bytes.end).div_ceil(page)
 }
 
 fn subresource_changed(span: std::ops::Range<usize>, pages: &[(usize, u64)], previous: u64) -> bool {
@@ -1141,7 +1150,7 @@ impl Staging {
                     && self.detiled_ok.load(std::sync::atomic::Ordering::Acquire))
                     .then_some((&written[..], previous));
                 // Read through the copy, which stands unmapped pages.
-                with_read(size, |read| {
+                let copied = with_read(size, |read| {
                     let mapping = changed.and_then(|_| crate::watch::title_memory_reading_now());
                     let changed = if mapping.is_some()
                         && !self.remap_pending.load(std::sync::atomic::Ordering::Acquire)
@@ -1150,15 +1159,26 @@ impl Staging {
                     } else {
                         None
                     };
-                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    let partial = changed.and_then(|(pages, previous)| {
+                        self.copy_changed_snapshot(read, pages, previous)
+                    });
+                    let (bytes, changed) = if let Some(bytes) = partial {
+                        (bytes, changed)
+                    } else {
+                        crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                        (size, None)
+                    };
                     drop(mapping);
-                    self.detile_changed(read, wait_flight, changed);
+                    if bytes != 0 {
+                        self.detile_changed(read, wait_flight, changed);
+                    }
+                    bytes
                 });
                 last.watched = self.detiled_ok.load(std::sync::atomic::Ordering::Acquire);
                 last.hash = None;
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-                return size;
+                crate::copystat::add(crate::copystat::C::TexWatched, copied as u64);
+                return copied;
             }
         }
         last.watched = false;
@@ -1293,6 +1313,48 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8], wait_flight: &mut dyn FnMut(u64)) {
         self.detile_changed(tiled, wait_flight, None);
+    }
+
+    /// Copy one bounding span for the affected subresources. This keeps the
+    /// original layout offsets and caps the fast path at one kernel read.
+    /// A failed read requires the original full sparse snapshot and detile.
+    fn copy_changed_snapshot(
+        &self,
+        read: &mut [u8],
+        pages: &[(usize, u64)],
+        previous: u64,
+    ) -> Option<usize> {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return None;
+        }
+        let (mut start, mut end) = (read.len(), 0);
+        for i in 0..self.footprints.len() as u32 {
+            let (mip, slice) = (i % self.mips, i / self.mips);
+            if subresource_changed(
+                subresource_pages(&self.layout, self.memory as usize, mip, slice),
+                pages,
+                previous,
+            ) {
+                let span = subresource_bytes(&self.layout, mip, slice);
+                start = start.min(span.start);
+                end = end.max(span.end);
+            }
+        }
+        if end == 0 {
+            return Some(0);
+        }
+        // Keep the ordinary copy and its accounting for full snapshots.
+        if start == 0 && end == read.len() {
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, read.len(), false);
+            return Some(read.len());
+        }
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        let copied = crate::host::read_into(self.memory.wrapping_add(start), read.get_mut(start..end)?);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        copied.then_some(end - start)
     }
 
     fn detile_changed(
@@ -2133,7 +2195,7 @@ mod title_memory_tests {
     #[test]
     fn partial_detile_staging_matches_full_refresh_after_a_mip_change_and_remap() {
         let Some(_) = crate::host::host() else { return };
-        let (resource, _, size, host_tex) = make_test_texture(512, 512, 3);
+        let (resource, memory, size, host_tex) = make_test_texture(512, 512, 3);
         let stage = super::staging(resource, host_tex).expect("title texture staging");
         assert!(!stage.on_demand);
         let mut tiled = vec![0x11; size];
@@ -2155,7 +2217,18 @@ mod title_memory_tests {
         stage.detile(&tiled, &mut |_| unreachable!());
         let initial = snapshots();
         tiled[at] = 0x22;
-        stage.detile_changed(&tiled, &mut |_| unreachable!(), Some((&[(page, 2)], previous)));
+        // SAFETY: the fixture owns `size` committed bytes at `memory`.
+        unsafe { memory.copy_from_nonoverlapping(tiled.as_ptr(), size) };
+        let mut scratch = vec![0xee; size];
+        let watched = [(page, 2)];
+        let mip = super::subresource_bytes(&stage.layout, 0, 0);
+        assert_eq!(stage.copy_changed_snapshot(&mut scratch, &watched, previous), Some(mip.len()));
+        assert!(mip.len() < size);
+        assert_eq!(&scratch[mip.clone()], &tiled[mip.clone()]);
+        assert!(scratch[..mip.start].iter().all(|&byte| byte == 0xee));
+        assert!(scratch[mip.end..].iter().all(|&byte| byte == 0xee));
+        assert_eq!(stage.copy_changed_snapshot(&mut scratch, &watched, 2), Some(0));
+        stage.detile_changed(&scratch, &mut |_| unreachable!(), Some((&watched, previous)));
         let selected = snapshots();
         assert_ne!(selected[0], initial[0]);
         assert_eq!(selected[2], initial[2]);
