@@ -1321,11 +1321,11 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                "a sampled texture's memory is all zero"
             );
         }
         let started = std::time::Instant::now();
