@@ -730,8 +730,21 @@ impl TextureQueue {
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
-    /// Bytes of slot `index`'s memory that were mapped at its last upload
-    /// (0: not uploaded, or all of it was).
+    /// Keep the previous host texture while backing shrinks. Remember the
+    /// smaller range so a later increase requeues an upload even if it only
+    /// restores the previous number of bytes.
+    fn defer_partial(&mut self, index: u32, write: u64, frame: u64, most: u64, mapped: u64) -> bool {
+        let Some(slot) = self.same(index, write) else { return true };
+        if mapped > slot.mapped {
+            return false;
+        }
+        slot.mapped = mapped;
+        self.later(index, write, frame, most);
+        true
+    }
+
+    /// Partial backing count used to decide whether to upload again.
+    #[cfg(test)]
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
@@ -1230,13 +1243,8 @@ impl HostHeap {
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64, unmapped: bool) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        if unmapped {
-            textures.unmapped(index, write, frame, most);
-        } else {
-            textures.later(index, write, frame, most);
-        }
+    pub(crate) fn texture_slot_unmapped(&self, index: u32, write: u64, frame: u64, most: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).unmapped(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
@@ -1249,10 +1257,8 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
     }
 
-    /// Bytes of title slot `index`'s memory that were mapped when it was
-    /// last uploaded in part (0: not uploaded, or whole).
-    pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    pub(crate) fn defer_partial_texture(&self, index: u32, write: u64, frame: u64, most: u64, mapped: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).defer_partial(index, write, frame, most, mapped)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -3825,6 +3831,21 @@ mod tests {
         queue.unmapped(3, write, 2, 16);
         assert_eq!(queue.due(3, 1), [(3, write)]);
         assert_eq!(queue.mapped(3), 0);
+    }
+
+    #[test]
+    fn a_partially_evicted_texture_uploads_when_its_backing_returns() {
+        let mut queue = TextureQueue::default();
+        queue.changed(3, 1, 1);
+        let (_, write) = queue.due(1, 1)[0];
+        queue.partly(3, write, 2, 8192);
+        assert!(queue.defer_partial(3, write, 2, 16, 4096));
+        assert!(queue.defer_partial(3, write, 3, 16, 4096));
+        assert!(!queue.defer_partial(3, write, 4, 16, 8192));
+        queue.changed(3, 5, 5);
+        assert!(queue.defer_partial(3, write, 5, 16, 4096));
+        assert_eq!(queue.mapped(3), 0);
+        assert_eq!(queue.due(5, 1).len(), 1);
     }
 
     #[test]

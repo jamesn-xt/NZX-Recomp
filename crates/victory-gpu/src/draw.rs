@@ -1883,13 +1883,12 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index, handle, record);
-                    host.texture_slot_later(index, write, frame, most, true);
+                    host.texture_slot_unmapped(index, write, frame, most);
                     continue;
                 }
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    if host.defer_partial_texture(index, write, frame, most, mapped) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most, false);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
