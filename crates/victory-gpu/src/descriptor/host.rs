@@ -184,11 +184,9 @@ pub(crate) struct Spans {
 /// When a view the title writes makes an older view of other memory stale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
-    /// with another length, or within the older one's first [`HEAD`]
-    /// bytes (or the older within its own). No two textures share the
-    /// block of their smallest levels. A view that only reaches into the
-    /// address range of an older texture's larger levels says nothing.
+    /// When the textures' heads overlap. Each head is bounded by the
+    /// texture's own size and by [`HEAD`]. A view that only reaches into
+    /// the address range of an older texture's larger levels says nothing.
     #[default]
     Start,
     /// Whenever their spans at full size overlap (the rule until run
@@ -252,7 +250,8 @@ impl Spans {
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .range(start.saturating_sub(HEAD - 1)..end.min(start.saturating_add(HEAD)))
+                .filter(|&(&at, &(old_end, _))| old_end.min(at.saturating_add(HEAD)) > start)
                 .map(|(at, _)| *at)
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
@@ -305,7 +304,11 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        let after_head = start.saturating_add(HEAD);
+        if after_head >= end {
+            return None;
+        }
+        self.by_start.range(after_head..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -3693,6 +3696,23 @@ mod tests {
         // A draw makes a slot of the second texture: it is one of them.
         assert!(spans.note(9, b, b + 0x2c000, false).is_empty());
         assert_eq!(spans.by_slot.get(&9), Some(&b));
+    }
+
+    #[test]
+    fn nonoverlapping_palettes_in_one_page_remain_tracked() {
+        for reverse in [false, true] {
+            let mut spans = Spans::default();
+            let palettes = [(1, 0x10000, 0x10100), (2, 0x10100, 0x10300)];
+            for i in [usize::from(reverse), usize::from(!reverse)] {
+                let (slot, start, end) = palettes[i];
+                assert!(spans.note(slot, start, end, true).is_empty());
+            }
+            assert_eq!(spans.slots_at(0x10000), [1]);
+            assert_eq!(spans.slots_at(0x10100), [2]);
+            assert_eq!(spans.next_start(0x10000, 0x10100), None);
+            // This new palette actually overlaps both older ones.
+            assert_eq!(spans.note(3, 0x10080, 0x10180, true), [1, 2]);
+        }
     }
 
     /// A texture written where another starts replaces it: at the same
