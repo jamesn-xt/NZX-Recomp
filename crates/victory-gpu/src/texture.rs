@@ -1355,11 +1355,6 @@ impl Staging {
         if end == 0 {
             return Some(0);
         }
-        // Keep the ordinary copy and its accounting for full snapshots.
-        if start == 0 && end == read.len() {
-            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, read.len(), false);
-            return Some(read.len());
-        }
         #[cfg(feature = "diagnostics")]
         let moved = std::time::Instant::now();
         let copied = crate::host::read_into(self.memory.wrapping_add(start), read.get_mut(start..end)?);
@@ -1394,7 +1389,7 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
+        if changed.is_none() && tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -2231,7 +2226,7 @@ mod title_memory_tests {
         assert!(!unaffected.contains(&page));
         let snapshots = || {
             stage.footprints.iter().zip(&stage.rows).map(|(fp, rows)| {
-                let size = fp.Footprint.RowPitch as usize * *rows as usize;
+                let size = stage.linear_len(fp, fp.Footprint.RowPitch as usize * *rows as usize);
                 // SAFETY: staging is live, its footprints are initialized by
                 // detiling, and this fixture owns all accesses.
                 unsafe { std::slice::from_raw_parts(stage.data.add(fp.Offset as usize), size).to_vec() }
