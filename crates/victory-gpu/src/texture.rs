@@ -10,7 +10,7 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Write-watched 2D textures can refresh just the affected subresources.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -81,9 +81,37 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    watched: bool,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     motion: Motion,
+}
+
+/// Conservative detile source span for one 2D subresource. Packed mips
+/// share a block and are all affected by a write anywhere in that block.
+fn subresource_pages(
+    layout: &victory_formats::texture::Layout,
+    address: usize,
+    mip: u32,
+    slice: u32,
+) -> std::ops::Range<usize> {
+    let m = &layout.mips[mip as usize];
+    let start = address + (u64::from(slice) * layout.slice_size + m.offset) as usize;
+    let bytes = if m.tail.is_some() {
+        layout.alignment as usize
+    } else {
+        m.pitch as usize * m.rows as usize * layout.desc.element_bytes as usize
+    };
+    let page = crate::watch::PAGE;
+    start / page..(start + bytes).div_ceil(page)
+}
+
+fn subresource_changed(span: std::ops::Range<usize>, pages: &[(usize, u64)], previous: u64) -> bool {
+    let from = pages.partition_point(|&(page, _)| page < span.start);
+    pages[from..]
+        .iter()
+        .take_while(|&&(page, _)| page < span.end)
+        .any(|&(_, epoch)| epoch > previous)
 }
 
 /// Probe a changed texture on its next check; only repeated changes keep
@@ -1090,9 +1118,11 @@ impl Staging {
         if let Some((now, written, guarded)) =
             waited(1, || crate::watch::writes_with_source(start, start + size, guard))
         {
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let previous = last.asked;
+            let unwritten = previous != 0 && written.iter().all(|&(_, w)| w <= previous);
             last.asked = now;
             if guarded {
+                last.watched = false;
                 const HASH_EVERY: u64 = 8;
                 let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
                 if !remapped && unwritten && !turn && !last.motion.active(frame) {
@@ -1100,19 +1130,38 @@ impl Staging {
                 }
             } else {
                 last.motion = Motion::default();
-                if !remapped && unwritten {
+                if !remapped && unwritten && last.watched {
                     return 0;
                 }
+                let changed = (!remapped
+                    && last.watched
+                    && !self.on_demand
+                    && self.mips > 1
+                    && self.layout.desc.dimension == victory_formats::texture::Dimension::Tex2d
+                    && self.detiled_ok.load(std::sync::atomic::Ordering::Acquire))
+                    .then_some((&written[..], previous));
                 // Read through the copy, which stands unmapped pages.
                 with_read(size, |read| {
+                    let mapping = changed.and_then(|_| crate::watch::title_memory_reading_now());
+                    let changed = if mapping.is_some()
+                        && !self.remap_pending.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        changed
+                    } else {
+                        None
+                    };
                     crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                    self.detile(read, wait_flight);
+                    drop(mapping);
+                    self.detile_changed(read, wait_flight, changed);
                 });
+                last.watched = self.detiled_ok.load(std::sync::atomic::Ordering::Acquire);
+                last.hash = None;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
                 return size;
             }
         }
+        last.watched = false;
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1236,6 +1285,15 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8], wait_flight: &mut dyn FnMut(u64)) {
+        self.detile_changed(tiled, wait_flight, None);
+    }
+
+    fn detile_changed(
+        &self,
+        tiled: &[u8],
+        wait_flight: &mut dyn FnMut(u64),
+        changed: Option<(&[(usize, u64)], u64)>,
+    ) {
         let need = self.in_flight();
         if need != 0 {
             wait_flight(need);
@@ -1268,6 +1326,15 @@ impl Staging {
         let mut succeeded = true;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            if let Some((pages, previous)) = changed
+                && !subresource_changed(
+                    subresource_pages(&self.layout, self.memory as usize, mip, slice),
+                    pages,
+                    previous,
+                )
+            {
+                continue;
+            }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1813,6 +1880,55 @@ mod title_memory_tests {
     use super::with_title;
 
     #[test]
+    fn partial_detile_spans_cover_visible_texels_and_shared_mip_tails() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let page = crate::watch::PAGE;
+        let address = page - 16;
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 128,
+                depth: 2,
+                mips: 8,
+                samples: 1,
+                swizzle,
+                element_bytes: 4,
+                block: 1,
+            }).unwrap();
+            for slice in 0..2 {
+                for mip in 0..8 {
+                    let span = super::subresource_pages(&layout, address, mip, slice);
+                    let m = &layout.mips[mip as usize];
+                    for y in 0..m.height {
+                        for x in 0..m.width {
+                            let start = address + layout.offset(mip, x, y, slice).unwrap() as usize;
+                            assert!(span.contains(&(start / page)));
+                            assert!(span.contains(&((start + 3) / page)));
+                        }
+                    }
+                    if m.tail.is_some() {
+                        assert_eq!(span, super::subresource_pages(&layout, address, layout.first_tail_mip, slice));
+                    }
+                }
+            }
+            assert!(super::subresource_pages(&layout, address, 0, 0).end
+                <= super::subresource_pages(&layout, address, 0, 1).start);
+            let changed = (address + layout.offset(0, 255, 127, 0).unwrap() as usize) / page;
+            let writes = [(changed, 12)];
+            assert!(super::subresource_changed(
+                super::subresource_pages(&layout, address, 0, 0), &writes, 11,
+            ));
+            assert!(!super::subresource_changed(
+                super::subresource_pages(&layout, address, 0, 1), &writes, 11,
+            ));
+            assert!(!super::subresource_changed(
+                super::subresource_pages(&layout, address, 0, 0), &writes, 12,
+            ));
+        }
+    }
+
+    #[test]
     fn protected_texture_pages_are_not_whole_backing() {
         use windows_sys::Win32::System::Memory::*;
         const PAGE: usize = 4096;
@@ -1964,14 +2080,14 @@ mod title_memory_tests {
     /// Creates a small committed 2D `R8G8B8A8_UNORM` linear texture backed by
     /// title memory, for exercising submission-time prelude uploads on the
     /// host D3D12 device.
-    fn make_test_texture() -> (
+    fn make_test_texture(width: u32, height: u32, mips: u32) -> (
         crate::object::This,
         *mut u8,
         usize,
         &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     ) {
         let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
-        let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
+        let desc_words: [u32; 14] = [3, 0, 0, 0, width, 0, height, (mips << 16) | 1, 28, 1, 0, 256, 0, 0];
         // SAFETY: plain structs with exact repr(C) layouts.
         let (heap, desc) = unsafe {
             (
@@ -2005,6 +2121,47 @@ mod title_memory_tests {
             .size as usize;
         let host_tex = crate::resource::host_resource(resource).expect("host texture");
         (resource, mem.cast_mut(), size, host_tex)
+    }
+
+    #[test]
+    fn partial_detile_staging_matches_full_refresh_after_a_mip_change_and_remap() {
+        let Some(_) = crate::host::host() else { return };
+        let (resource, _, size, host_tex) = make_test_texture(512, 512, 3);
+        let stage = super::staging(resource, host_tex).expect("title texture staging");
+        assert!(!stage.on_demand);
+        let mut tiled = vec![0x11; size];
+        let range = super::subresource_pages(&stage.layout, stage.memory as usize, 0, 0);
+        let previous = 1;
+        let at = stage.layout.offset(0, 511, 511, 0).unwrap() as usize;
+        let page = (stage.memory as usize + at) / crate::watch::PAGE;
+        assert!(range.contains(&page));
+        let unaffected = super::subresource_pages(&stage.layout, stage.memory as usize, 2, 0);
+        assert!(!unaffected.contains(&page));
+        let snapshots = || {
+            stage.footprints.iter().zip(&stage.rows).map(|(fp, rows)| {
+                let size = fp.Footprint.RowPitch as usize * *rows as usize;
+                // SAFETY: staging is live, its footprints are initialized by
+                // detiling, and this fixture owns all accesses.
+                unsafe { std::slice::from_raw_parts(stage.data.add(fp.Offset as usize), size).to_vec() }
+            }).collect::<Vec<_>>()
+        };
+        stage.detile(&tiled, &mut |_| unreachable!());
+        let initial = snapshots();
+        tiled[at] = 0x22;
+        stage.detile_changed(&tiled, &mut |_| unreachable!(), Some((&[(page, 2)], previous)));
+        let selected = snapshots();
+        assert_ne!(selected[0], initial[0]);
+        assert_eq!(selected[2], initial[2]);
+        stage.detile(&tiled, &mut |_| unreachable!());
+        assert_eq!(selected, snapshots());
+        // The remap path must refresh the entire snapshot, even without a
+        // watch write for a mip whose backing was removed.
+        let at = stage.layout.offset(2, 0, 0, 0).unwrap() as usize;
+        tiled[at] = 0;
+        stage.detile_changed(&tiled, &mut |_| unreachable!(), None);
+        assert_eq!(snapshots()[2][0], 0);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
     }
 
     fn read_texel_byte(
@@ -2083,7 +2240,7 @@ mod title_memory_tests {
         let Some(host) = crate::host::host() else {
             return;
         };
-        let (resource, mem, size, host_tex) = make_test_texture();
+        let (resource, mem, size, host_tex) = make_test_texture(16, 4, 1);
         // Frame 1: initial contents upload on first submission.
         // SAFETY: `mem` points to `size` bytes of our committed resource.
         unsafe { mem.write_bytes(0x11, size) };
@@ -2110,7 +2267,7 @@ mod title_memory_tests {
         let Some(host) = crate::host::host() else {
             return;
         };
-        let (resource, mem, size, host_tex) = make_test_texture();
+        let (resource, mem, size, host_tex) = make_test_texture(16, 4, 1);
         // SAFETY: `mem` points to `size` bytes of our committed resource.
         unsafe { mem.write_bytes(0x33, size) };
         assert_eq!(read_texel_byte(host, resource, host_tex, true), 0x33);
