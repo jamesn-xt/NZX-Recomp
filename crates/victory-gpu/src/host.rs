@@ -4440,7 +4440,6 @@ impl Host {
                 }
                 // Pieces (copy, number) the compare flagged, with their ticket.
                 let mut tickets: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
-                let mut flags: Vec<(usize, u32, bool)> = Vec::new();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -4458,26 +4457,23 @@ impl Host {
                             }
                             tickets.insert((copy, r.span.first + p), entry);
                         }
-                        flags.push((copy, r.span.first + p, flag != 0));
                     }
                 }
-                let fetched = flagged_pieces(&flags);
                 let mut seen = std::collections::HashSet::new();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let piece = r.span.first + p;
-                        if !fetched.contains(&(copy, piece)) {
+                        // A ticket covers the whole piece even if only
+                        // another declared range of that piece flagged it.
+                        let Some(&k) = tickets.get(&(copy, piece)) else {
                             continue;
-                        }
+                        };
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo >= hi || !seen.insert((copy, lo, hi)) {
                             continue;
                         }
                         let from = inflight_piece_from(&r.span, p);
-                        let Some(&k) = tickets.get(&(copy, piece)) else {
-                            return false;
-                        };
                         if lo < from || (hi - from) as u64 > INFLIGHT_SLOT {
                             return false;
                         }
@@ -4489,8 +4485,12 @@ impl Host {
                             .filter(|b| b.3 >= plan.sent_as && Arc::ptr_eq(&b.0, &r.shadow) && b.1 < hi && b.2 > lo)
                             .map(|b| (b.1, b.2))
                             .collect();
-                        for (a, b) in crate::shadow::outside(lo, hi, newer) {
-                            pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
+                        if newer.is_empty() {
+                            pieces.push((r.shadow.clone(), lo, hi, slot + (lo - from), plan.sent_as));
+                        } else {
+                            for (a, b) in crate::shadow::outside(lo, hi, newer) {
+                                pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
+                            }
                         }
                     }
                 }
