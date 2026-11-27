@@ -1148,17 +1148,20 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                // The owned snapshot outlives the mapping lock. Detiling
-                // may wait on an earlier upload fence.
+                // A sparse copy zero-fills holes, but a readable page may
+                // contain real zero texels. Keep the previous image only
+                // if all pages are absent; do not remember that as a hash.
+                if read.iter().all(|&b| b == 0) && mapped_regions(start, start + size).0 == 0 {
+                    return false;
+                }
+                // Detiling can wait on an earlier upload fence, so release
+                // the mapping lock once the owned snapshot is ready.
                 drop(_mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
-                    return false;
-                }
                 self.detile(read, wait_flight);
                 true
             });
@@ -1731,6 +1734,36 @@ mod remap_tests {
         super::unstage(resource);
         drop(staging);
         // SAFETY: no staged read remains and the reservation is released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn zero_texels_replace_stale_data_in_a_partially_mapped_texture() {
+        use windows_sys::Win32::System::Memory::*;
+        assert!(crate::host::host().is_some(), "the staging test needs D3D12");
+        const PAGE: usize = 64 << 10;
+        // SAFETY: this test owns the reservation and commits only its first page.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        assert_eq!(unsafe { VirtualAlloc(base, PAGE, MEM_COMMIT, PAGE_READWRITE) }, base);
+        let desc = [3, 0, 0, 0, 256, 0, 256, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let resource = crate::resource::texture_at(base as u64, &desc).unwrap();
+        let staging = super::staging(resource, crate::resource::host_resource(resource).unwrap()).unwrap();
+        assert!(staging.layout.size > PAGE as u64);
+        let mut no_flight = |_| panic!("test staging was never submitted");
+
+        // SAFETY: both writes are restricted to the one committed page.
+        unsafe { base.cast::<u8>().write_bytes(0x68, PAGE) };
+        staging.refresh_timed(&mut no_flight);
+        assert_eq!(unsafe { *staging.data }, 0x68);
+        unsafe { base.cast::<u8>().write_bytes(0, PAGE) };
+        crate::watch::title_memory_remapped(base as usize, PAGE);
+        staging.refresh_timed(&mut no_flight);
+        assert_eq!(unsafe { *staging.data }, 0, "resident zero texels must replace stale staging data");
+
+        super::unstage(resource);
+        drop(staging);
+        // SAFETY: no staged read remains and the test releases its reservation once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
