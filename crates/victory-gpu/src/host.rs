@@ -2300,6 +2300,11 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Relay landing time spent on card-copy merges (including any fallback
+/// fetch), CPU-backed copies, and completion processing.
+static RELAY_LANDING_US: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
 /// went the old way because a plan's pieces overflowed the slots, and
@@ -3087,6 +3092,13 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        let [card, cpu, complete] = RELAY_LANDING_US.each_ref().map(|value| {
+            value.swap(0, Ordering::Relaxed) as f64 / (1000.0 * frames)
+        });
+        tracing::info!(
+            "relay landing per frame: {card:.2} ms handling card-copy data (including fallback fetch), \
+             {cpu:.2} ms handling CPU-backed data, {complete:.2} ms handling readbacks, signals and completion"
         );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4553,7 +4565,10 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                let card_started = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch);
+                let cpu_started = std::time::Instant::now();
+                RELAY_LANDING_US[0].fetch_add((cpu_started - card_started).as_micros() as u64, Ordering::Relaxed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4577,12 +4592,14 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                RELAY_LANDING_US[1].fetch_add(cpu_started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
         // In the order given: what tells the title the card is done.
+        let complete_started = std::time::Instant::now();
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -4606,6 +4623,7 @@ impl Host {
             bury(last);
         }
         self.log_messages();
+        RELAY_LANDING_US[2].fetch_add(complete_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             let mut line = line();
