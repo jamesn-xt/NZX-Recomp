@@ -48,7 +48,7 @@ pub(crate) struct Staging {
     /// prelude last uploaded it, and whether one has uploaded it at all:
     /// `HostList::prelude` records the GPU copy only when either holds,
     /// after `refresh` has already checked title memory for this submission.
-    dirty: std::sync::atomic::AtomicBool,
+    pending_subresources: std::sync::atomic::AtomicU64,
     uploaded: std::sync::atomic::AtomicBool,
     /// A detile completed without a format or layout error.
     detiled_ok: std::sync::atomic::AtomicBool,
@@ -241,7 +241,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
         let (start, bytes) = staging.memory();
         if start.saturating_add(bytes) > at {
             staging.remap_pending.store(true, Relaxed);
-            staging.dirty.store(true, Relaxed);
+            staging.require_full_upload();
         }
     }
 }
@@ -768,7 +768,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         note(Blocker::Texture);
         return;
     };
-    use std::sync::atomic::Ordering::{Relaxed, Release};
+    use std::sync::atomic::Ordering::Relaxed;
     // These are textures reached through a table or by a dependent copy.
     // Leaving a table's slot out of the background queue does not mean its
     // texture made it to the card. Give a fresh upload a later frame to
@@ -789,7 +789,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // this list's submission, and uploaded by this list.
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
-        staging.dirty.store(true, Release);
+        staging.require_full_upload();
     }
     // Levels on demand: the last upload left a held level without tiles
     // (the card had no room, or no heap could be had), and nothing else
@@ -802,7 +802,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
             if crate::resource::room_lately() {
                 staging.waiting.store(0, Relaxed);
-                staging.dirty.store(true, Release);
+                staging.require_full_upload();
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
             } else {
                 staging.waiting.store(crate::host::moment().max(1), Relaxed);
@@ -822,7 +822,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     {
         let staging = staging.clone();
         list.defer_host(move || {
-            if !staging.uploaded.load(Relaxed) || staging.dirty.load(Relaxed) {
+            if !staging.uploaded.load(Relaxed) || staging.pending_subresources.load(Relaxed) != 0 {
                 let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
                 staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
                 if waiting {
@@ -1029,24 +1029,31 @@ impl Staging {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Whether this staging buffer needs to be copied into its host texture
-    /// now (first upload or detiled since the last upload), marking it
-    /// uploaded. Called from `HostList::prelude` after `refresh` has run.
-    pub(crate) fn take_upload(&self) -> bool {
-        use std::sync::atomic::Ordering::AcqRel;
-        let first = !self.uploaded.swap(true, AcqRel);
-        let dirty = self.dirty.swap(false, AcqRel);
-        first || dirty
+    fn require_full_upload(&self) {
+        self.pending_subresources.store(u64::MAX, std::sync::atomic::Ordering::Release);
     }
 
-    /// Records the copy of every subresource from the staging buffer into
+    /// Takes the pending subresources after refresh. All bits set means a
+    /// full upload, including textures with more than 64 subresources.
+    pub(crate) fn take_upload(&self) -> u64 {
+        use std::sync::atomic::Ordering::AcqRel;
+        let first = !self.uploaded.swap(true, AcqRel);
+        let pending = self.pending_subresources.swap(0, AcqRel);
+        if first { u64::MAX } else { pending }
+    }
+
+    /// Records the pending copies from the staging buffer into
     /// `texture` (which must be in `D3D12_RESOURCE_STATE_COPY_DEST`).
     pub(crate) fn record_copy(
         &self,
         list: &ID3D12GraphicsCommandList,
         texture: &ID3D12Resource,
+        subresources: u64,
     ) {
         for (i, footprint) in self.footprints.iter().enumerate() {
+            if subresources != u64::MAX && (i >= 64 || subresources & (1 << i) == 0) {
+                continue;
+            }
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1373,7 +1380,6 @@ impl Staging {
         if need != 0 {
             wait_flight(need);
         }
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1399,6 +1405,7 @@ impl Staging {
         let started = std::time::Instant::now();
         let workers = detile_workers();
         let mut succeeded = true;
+        let mut pending = 0u64;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             if let Some((pages, previous)) = changed
@@ -1410,6 +1417,7 @@ impl Staging {
             {
                 continue;
             }
+            pending |= 1u64.checked_shl(i as u32).unwrap_or(u64::MAX);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let depth_pitch = pitch * rows as usize;
@@ -1434,6 +1442,11 @@ impl Staging {
                 succeeded = false;
                 break;
             }
+        }
+        if changed.is_none() || !succeeded {
+            self.require_full_upload();
+        } else {
+            self.pending_subresources.fetch_or(pending, std::sync::atomic::Ordering::Release);
         }
         self.detiled_ok.store(succeeded && held != 0, std::sync::atomic::Ordering::Release);
         DETILE_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1499,7 +1512,7 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
-    Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
+    Some((staging.uploaded.load(Relaxed), staging.pending_subresources.load(Relaxed) != 0))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
@@ -1785,7 +1798,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         last: Mutex::default(),
-        dirty: std::sync::atomic::AtomicBool::new(true),
+        pending_subresources: std::sync::atomic::AtomicU64::new(u64::MAX),
         detiled_ok: std::sync::atomic::AtomicBool::new(false),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
@@ -1948,14 +1961,14 @@ mod remap_tests {
         if let Some(staging) = staged {
             // The state after a submitted list uploaded the texture.
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            staging.pending_subresources.store(0, Relaxed);
 
             super::remapped(texture_start + PAGE_RUN, PAGE_RUN);
             super::remapped(texture_start, 0);
-            assert!(!staging.dirty.load(Relaxed), "a remap elsewhere marked the texture");
+            assert_eq!(staging.pending_subresources.load(Relaxed), 0, "a remap elsewhere marked the texture");
 
             super::remapped(texture_start + 0x10, 0x10);
-            assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
+            assert_eq!(staging.pending_subresources.load(Relaxed), u64::MAX, "a remap under the texture did not request a full upload");
         }
         // SAFETY: the allocation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
@@ -2212,7 +2225,7 @@ mod title_memory_tests {
 
     #[test]
     fn partial_detile_staging_matches_full_refresh_after_a_mip_change_and_remap() {
-        let Some(_) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else { return };
         let (resource, memory, size, host_tex) = make_test_texture(512, 512, 3);
         let stage = super::staging(resource, host_tex).expect("title texture staging");
         assert!(!stage.on_demand);
@@ -2234,7 +2247,10 @@ mod title_memory_tests {
         };
         stage.detile(&tiled, &mut |_| unreachable!());
         let initial = snapshots();
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 2, Some(&stage)), 0x11);
         tiled[at] = 0x22;
+        let first_texel = stage.layout.offset(0, 0, 0, 0).unwrap() as usize;
+        tiled[first_texel] = 0x42;
         // SAFETY: the fixture owns `size` committed bytes at `memory`.
         unsafe { memory.copy_from_nonoverlapping(tiled.as_ptr(), size) };
         let mut scratch = vec![0xee; size];
@@ -2250,6 +2266,14 @@ mod title_memory_tests {
         let selected = snapshots();
         assert_ne!(selected[0], initial[0]);
         assert_eq!(selected[2], initial[2]);
+        // Poison the clean staging mip for this readback. If the prelude
+        // copies that mip again, the resource would pick up this byte.
+        let clean = stage.footprints[2].Offset as usize;
+        // SAFETY: the first submission has finished and this fixture owns
+        // the staging writes. This byte is inside subresource 2.
+        unsafe { stage.data.add(clean).write(0xee) };
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 0, Some(&stage)), 0x42);
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 2, Some(&stage)), 0x11);
         stage.detile(&tiled, &mut |_| unreachable!());
         assert_eq!(selected, snapshots());
         // The remap path must refresh the entire snapshot, even without a
@@ -2258,6 +2282,21 @@ mod title_memory_tests {
         tiled[at] = 0;
         stage.detile_changed(&tiled, &mut |_| unreachable!(), None);
         assert_eq!(snapshots()[2][0], 0);
+        assert_eq!(stage.take_upload(), u64::MAX);
+        let other_page = (stage.memory as usize + at) / crate::watch::PAGE;
+        let mut expected = 0;
+        for written in [page, other_page] {
+            for mip in 0..3 {
+                if super::subresource_pages(&stage.layout, stage.memory as usize, mip, 0)
+                    .contains(&written)
+                {
+                    expected |= 1 << mip;
+                }
+            }
+            stage.detile_changed(&tiled, &mut |_| unreachable!(), Some((&[(written, 2)], previous)));
+        }
+        assert_eq!(stage.take_upload(), expected);
+        assert_eq!(stage.take_upload(), 0);
         let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
         assert_eq!(release(resource), 0);
     }
@@ -2287,6 +2326,8 @@ mod title_memory_tests {
         resource: crate::object::This,
         host_tex: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         extra_list: bool,
+        mip: u32,
+        prepared: Option<&std::sync::Arc<super::Staging>>,
     ) -> u8 {
         use windows::Win32::Graphics::Direct3D12::*;
         const COPY_SOURCE: u32 = 0x800;
@@ -2298,7 +2339,7 @@ mod title_memory_tests {
         unsafe {
             host.device.GetCopyableFootprints(
                 &desc,
-                0,
+                mip,
                 1,
                 0,
                 Some(&mut footprint),
@@ -2309,7 +2350,11 @@ mod title_memory_tests {
         }
         let readback = host.read_back_buffer(total).expect("read-back buffer");
         let list = host.new_list().expect("host list");
-        super::upload(&list, resource, host_tex);
+        if let Some(stage) = prepared {
+            list.defer_texture_upload(crate::resource::host_copy(resource).unwrap(), stage.clone());
+        } else {
+            super::upload(&list, resource, host_tex);
+        }
         crate::list::ensure_state(&list, resource, COPY_SOURCE);
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -2324,7 +2369,7 @@ mod title_memory_tests {
             pResource: unsafe { std::mem::transmute_copy(host_tex) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: mip,
             },
         };
         // SAFETY: an open list and live resources in COPY_DEST / COPY_SOURCE.
@@ -2362,14 +2407,14 @@ mod title_memory_tests {
         // Frame 1: initial contents upload on first submission.
         // SAFETY: `mem` points to `size` bytes of our committed resource.
         unsafe { mem.write_bytes(0x11, size) };
-        assert_eq!(read_texel_byte(host, resource, host_tex, false), 0x11);
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 0, None), 0x11);
         // Frame 2: unchanged contents keep the texture as-is (clean state).
-        assert_eq!(read_texel_byte(host, resource, host_tex, false), 0x11);
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 0, None), 0x11);
         // Frame 3: CPU writes new contents; the GPU must see them on this
         // same submission rather than sampling the stale previous frame.
         // SAFETY: as above.
         unsafe { mem.write_bytes(0x22, size) };
-        assert_eq!(read_texel_byte(host, resource, host_tex, false), 0x22);
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 0, None), 0x22);
         // Release the test resource cleanly.
         let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
             resource, 0x10,
@@ -2388,10 +2433,10 @@ mod title_memory_tests {
         let (resource, mem, size, host_tex) = make_test_texture(16, 4, 1);
         // SAFETY: `mem` points to `size` bytes of our committed resource.
         unsafe { mem.write_bytes(0x33, size) };
-        assert_eq!(read_texel_byte(host, resource, host_tex, true), 0x33);
+        assert_eq!(read_texel_byte(host, resource, host_tex, true, 0, None), 0x33);
         // SAFETY: as above.
         unsafe { mem.write_bytes(0x44, size) };
-        assert_eq!(read_texel_byte(host, resource, host_tex, false), 0x44);
+        assert_eq!(read_texel_byte(host, resource, host_tex, false, 0, None), 0x44);
         let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
             resource, 0x10,
         );

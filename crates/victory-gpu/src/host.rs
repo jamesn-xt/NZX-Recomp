@@ -5891,10 +5891,11 @@ impl HostList {
                 .texture_uploads
                 .iter()
                 .filter_map(|(copy, staging)| {
-                    if staging.take_upload() {
+                    let subresources = staging.take_upload();
+                    if subresources != 0 {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::TexUploads, 1);
-                        Some((copy.clone(), staging.clone()))
+                        Some((copy.clone(), staging.clone(), subresources))
                     } else {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
@@ -5902,7 +5903,7 @@ impl HostList {
                     }
                 })
                 .collect();
-            deferred.texture_copies.extend(uploads.iter().map(|(_, staging)| staging.clone()));
+            deferred.texture_copies.extend(uploads.iter().map(|(_, staging, _)| staging.clone()));
             uploads
         };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -5956,7 +5957,7 @@ impl HostList {
                 }
             }
         }
-        for (copy, _) in &uploads {
+        for (copy, _, _) in &uploads {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             if copying.contains_key(&key) {
                 continue;
@@ -6005,8 +6006,8 @@ impl HostList {
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                for (copy, staging) in &uploads {
-                    staging.record_copy(list, &copy.texture);
+                for (copy, staging, subresources) in &uploads {
+                    staging.record_copy(list, &copy.texture, *subresources);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
