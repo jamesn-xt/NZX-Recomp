@@ -1283,6 +1283,13 @@ impl Staging {
         }
     }
 
+    fn linear_len(&self, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, depth_pitch: usize) -> usize {
+        // GetCopyableFootprints need not reserve pitch padding after
+        // the last row of the final subresource.
+        let padded = depth_pitch * footprint.Footprint.Depth as usize;
+        padded.min(self.bytes.saturating_sub(footprint.Offset) as usize)
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8], wait_flight: &mut dyn FnMut(u64)) {
         self.detile_changed(tiled, wait_flight, None);
@@ -1337,7 +1344,8 @@ impl Staging {
             }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
+            let depth_pitch = pitch * rows as usize;
+            let len = self.linear_len(footprint, depth_pitch);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -1347,7 +1355,6 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
-            let depth_pitch = pitch * rows as usize;
             let result = if workers > 1 && len >= 4 * 1024 * 1024 {
                 self.layout
                     .detile_parallel(tiled, mip, slice, linear, pitch, depth_pitch, workers)
@@ -2161,6 +2168,26 @@ mod title_memory_tests {
         stage.detile_changed(&tiled, &mut |_| unreachable!(), None);
         assert_eq!(snapshots()[2][0], 0);
         let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
+    }
+
+    #[test]
+    fn the_last_upload_footprint_stops_at_the_end_of_the_buffer() {
+        assert!(crate::host::host().is_some(), "the footprint test needs D3D12");
+        let (resource, _, _, host_tex) = make_test_texture(16, 4, 1);
+        let staging = super::staging(resource, host_tex).unwrap();
+        let footprint = &staging.footprints[0];
+        assert_eq!(footprint.Offset, 0);
+        let depth_pitch = footprint.Footprint.RowPitch as usize * staging.rows[0] as usize;
+        assert_eq!(depth_pitch, 1024);
+        assert_eq!(staging.bytes, 832);
+        assert_eq!(staging.linear_len(footprint, depth_pitch), 832);
+
+        super::unstage(resource);
+        drop(staging);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10,
+        );
         assert_eq!(release(resource), 0);
     }
 
