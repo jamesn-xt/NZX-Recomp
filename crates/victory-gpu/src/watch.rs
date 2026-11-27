@@ -425,6 +425,12 @@ pub(crate) fn writes_with_source(
 }
 
 impl Tracked {
+    /// A consumer could not read the page it took. Leave the journal
+    /// entry visible to this consumer on its next pass.
+    pub(crate) fn retry_page(&self, address: usize) {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address / PAGE));
+    }
+
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
@@ -1065,6 +1071,34 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_failed_descriptor_page_read_can_retry_without_a_second_write() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        // SAFETY: private test allocation, touched only by this test.
+        let bytes = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        }.cast::<u8>();
+        assert!(!bytes.is_null());
+        let address = bytes as usize;
+        let tracked = track(address, PAGE, false).expect("write-watched reservation");
+        unsafe { bytes.write(0x83) };
+        assert_eq!(tracked.take(address, address + PAGE), [(address, address + PAGE)]);
+        let mut prior = 0;
+        assert_ne!(unsafe { VirtualProtect(bytes.cast(), PAGE, PAGE_NOACCESS, &mut prior) }, 0);
+        let mut output = [0u8; 1];
+        assert!(!crate::host::read_into(bytes, &mut output));
+        tracked.retry_page(address);
+        assert_ne!(unsafe { VirtualProtect(bytes.cast(), PAGE, prior, &mut prior) }, 0);
+        assert_eq!(tracked.take(address, address + PAGE), [(address, address + PAGE)]);
+        assert!(crate::host::read_into(bytes, &mut output));
+        assert_eq!(output, [0x83]);
+        assert!(tracked.take(address, address + PAGE).is_empty());
+        assert_ne!(unsafe { VirtualFree(bytes.cast(), 0, MEM_RELEASE) }, 0);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

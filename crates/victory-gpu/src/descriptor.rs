@@ -215,6 +215,8 @@ pub(crate) fn sync_heaps() {
                     // page's slots under one lock (`HostHeap::mirror_copied`).
                     let records = records.inspect(|_| looked += 1);
                     mirrored += host.mirror_copied(records, |index| start + u64::from(index) * step, &mut changed);
+                } else {
+                    written.retry_page(from);
                 }
                 page += crate::watch::PAGE;
             }
