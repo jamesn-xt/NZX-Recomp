@@ -6985,14 +6985,17 @@ impl Meter {
                      hold still (the runtime remapping it), {detile:.1} ms detiling; the rest is reading and hashing"
                 );
             }
-            let [scans, scan_us, checks, check_us, skipped] =
-                crate::texture::HEAP_RESIDENCY.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
-            if scans + checks + skipped > 0.0 {
-                let (scan_ms, check_ms) = (scan_us / 1000.0, check_us / 1000.0);
-                tracing::info!(
-                    "heap texture residency per frame: {scans:.1} admission scans in {scan_ms:.2} ms, \
-                     {checks:.1} staging checks in {check_ms:.2} ms, {skipped:.1} staging checks skipped for partial textures"
-                );
+            #[cfg(feature = "diagnostics")]
+            {
+                let [scans, scan_us, checks, check_us, skipped] =
+                    crate::texture::HEAP_RESIDENCY.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+                if scans + checks + skipped > 0.0 {
+                    let (scan_ms, check_ms) = (scan_us / 1000.0, check_us / 1000.0);
+                    tracing::info!(
+                        "heap texture residency per frame: {scans:.1} admission scans in {scan_ms:.2} ms, \
+                         {checks:.1} staging checks in {check_ms:.2} ms, {skipped:.1} staging checks skipped for partial textures"
+                    );
+                }
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
